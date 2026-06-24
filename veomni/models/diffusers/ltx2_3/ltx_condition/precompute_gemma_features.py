@@ -5,7 +5,7 @@ the intermediate features to disk. During training, only the lightweight
 EmbeddingsProcessor connectors run on these features.
 
 Usage:
-    python veomni/models/diffusers/ltx2_3/precompute_ltx2_gemma_features.py \
+    python veomni/models/diffusers/ltx2_3/ltx_condition/precompute_gemma_features.py \
         --data_dir /path/to/training/data \
         --gemma_model_path /path/to/gemma3 \
         --checkpoint_path /path/to/ltx2-checkpoint.safetensors \

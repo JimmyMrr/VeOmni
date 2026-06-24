@@ -193,6 +193,79 @@ class LTXVideoConditionModel(PreTrainedModel):
         if self.meta_init:
             self.embeddings_processor.feature_extractor = None
 
+    def on_dataset_ready(self, trainer):
+        """Hook called by trainer after dataset is built. Adjusts training params for LTX-2."""
+        import torch.distributed as dist
+
+        from .....distributed.parallel_state import get_parallel_state
+
+        args = trainer.base.args
+        ps = get_parallel_state()
+        train_dataset = trainer.base.train_dataset
+
+        if train_dataset is None:
+            return
+
+        inner = train_dataset._data if hasattr(train_dataset, "_data") else train_dataset
+        if not hasattr(inner, "__len__"):
+            return
+
+        dataset_len = len(inner)
+        global_batch_size = args.train.global_batch_size
+        max_steps = args.train.max_steps
+
+        corrected_steps = max(1, dataset_len // global_batch_size)
+        if max_steps is not None:
+            corrected_steps = min(corrected_steps, max_steps)
+        args._train_steps = corrected_steps
+        trainer.base.train_steps = args.train_steps
+        logger.info_rank0(
+            f"Corrected train_steps based on actual dataset size: "
+            f"dataset_len={dataset_len}, global_batch_size={global_batch_size}, "
+            f"train_steps={corrected_steps}."
+        )
+
+        dp_size = ps.dp_size
+        per_rank_count = max(1, math.ceil(dataset_len / dp_size))
+        if args.train.dataloader_batch_size > per_rank_count:
+            old_bs = args.train.dataloader_batch_size
+            args.train.dataloader_batch_size = per_rank_count
+            logger.info_rank0(
+                f"Capped dataloader_batch_size from {old_bs} to {per_rank_count} "
+                f"(dataset_len={dataset_len}, dp_size={dp_size}, per_rank_count={per_rank_count}) "
+                f"to ensure DataLoader can form batches with drop_last=True."
+            )
+
+        if ps.dp_enabled and hasattr(args, "_train_steps"):
+            steps_t = torch.tensor([args._train_steps], dtype=torch.long, device=torch.device(get_device_type()))
+            dist.all_reduce(steps_t, op=dist.ReduceOp.MIN, group=ps.dp_group)
+            args._train_steps = int(steps_t.item())
+            trainer.base.train_steps = args.train_steps
+
+    def on_dataloader_ready(self, trainer):
+        """Hook called by trainer after dataloader is built. Adjusts micro-batch count for LTX-2."""
+        from .....data.data_collator import MakeMicroBatchCollator
+        from .....distributed.parallel_state import get_parallel_state
+
+        args = trainer.base.args
+        ps = get_parallel_state()
+        dataloader = trainer.base.train_dataloader
+
+        if args.train.dyn_bsz or dataloader is None:
+            return
+
+        num_micro_batch = args.train.global_batch_size // (args.train.micro_batch_size * ps.dp_size)
+        if num_micro_batch > args.train.dataloader_batch_size:
+            capped_nmb = max(1, args.train.dataloader_batch_size)
+            logger.info_rank0(
+                f"Capping num_micro_batch from {num_micro_batch} to {capped_nmb} "
+                f"(dataloader_batch_size={args.train.dataloader_batch_size}) "
+                f"to avoid empty micro-batches."
+            )
+            collate_fn = dataloader.collate_fn
+            if isinstance(collate_fn, MakeMicroBatchCollator):
+                collate_fn.num_micro_batch = capped_nmb
+
     def _encode_video_to_latents(self, video: torch.Tensor) -> torch.Tensor:
         height, width = video.shape[-2:]
         size = min(self.config.video_max_size, min(width, height))
@@ -207,12 +280,17 @@ class LTXVideoConditionModel(PreTrainedModel):
         return normalized_means
 
     @torch.no_grad()
-    def get_condition(self, inputs, videos, **kwargs) -> dict[str, Any]:
+    def get_condition(self, **kwargs) -> dict[str, Any]:
         """Online encoding: Gemma + feature extractor for text, VAE for video.
 
-        Note: For offline precompute, use the precompute_gemma_features.py script instead.
-        This method requires Gemma to be loaded, which is expensive.
+        For preprocessed/precomputed data (containing ``latents`` or ``video_prompt_embeds``),
+        returns the data unchanged — no online encoding needed.
+
+        For raw data (containing ``inputs`` and ``videos``), online Gemma encoding is not
+        supported. Pre-compute Gemma features using the precompute script instead.
         """
+        if "latents" in kwargs or "video_prompt_embeds" in kwargs:
+            return kwargs
         raise NotImplementedError(
             "Online Gemma encoding is not supported during training. "
             "Please pre-compute Gemma features using the precompute script and use offline_training mode."
@@ -256,16 +334,20 @@ class LTXVideoConditionModel(PreTrainedModel):
 
     def process_condition(
         self,
-        latents: list[torch.Tensor],
-        context: list[torch.Tensor],
+        latents: list[torch.Tensor] | None = None,
+        context: list[torch.Tensor] | None = None,
         context_mask: list[torch.Tensor] | None = None,
         audio_context: list[torch.Tensor] | None = None,
         audio_latents: list[torch.Tensor] | None = None,
-        first_frame_conditioning_p: float = 0.1,
-        timestep_sampling_mode: str = "shifted_logit_normal",
+        first_frame_conditioning_p: float | None = None,
+        timestep_sampling_mode: str | None = None,
         fps: list[float] | None = None,
+        **kwargs,
     ) -> dict[str, Any]:
         """Process pre-computed features: run connectors, add noise, compute targets.
+
+        Accepts both the unpacked format (``latents``, ``context``, etc.) and the raw
+        DiTDataCollator format (``video_prompt_embeds``, ``prompt_attention_mask``, etc.).
 
         Args:
             latents: List of video latent tensors [B, C, F, H, W].
@@ -274,8 +356,19 @@ class LTXVideoConditionModel(PreTrainedModel):
             audio_context: List of pre-computed audio feature tensors [B, S, D]. If None, no audio features.
             audio_latents: List of audio latent tensors [B, C, T, F]. If None, no audio latents.
             first_frame_conditioning_p: Probability of conditioning on the first frame.
+                Falls back to ``self.config.first_frame_conditioning_p`` if None.
             timestep_sampling_mode: "shifted_logit_normal" or "uniform".
+                Falls back to ``self.config.timestep_sampling_mode`` if None.
         """
+        if latents is None or context is None:
+            latents, context, context_mask, audio_context, audio_latents, fps = self._unpack_raw_batch(
+                kwargs, latents, context, context_mask, audio_context, audio_latents, fps
+            )
+
+        if first_frame_conditioning_p is None:
+            first_frame_conditioning_p = self.config.first_frame_conditioning_p
+        if timestep_sampling_mode is None:
+            timestep_sampling_mode = self.config.timestep_sampling_mode
         if timestep_sampling_mode == "uniform" and not self._timesteps_ready:
             self.scheduler.set_timesteps(self.config.num_train_timesteps, device=latents[0].device)
             self._timesteps_ready = True
@@ -461,6 +554,8 @@ class LTXVideoConditionModel(PreTrainedModel):
                 packed_conditions["audio_training_target"].append(audio_training_target)
                 packed_conditions["audio_loss_mask"].append(audio_loss_mask)
 
+        del packed_conditions["latents"]
+
         if not packed_conditions["audio_hidden_states"]:
             del packed_conditions["audio_hidden_states"]
             del packed_conditions["audio_timestep"]
@@ -469,6 +564,105 @@ class LTXVideoConditionModel(PreTrainedModel):
             del packed_conditions["audio_loss_mask"]
 
         return packed_conditions
+
+    @staticmethod
+    def _unpack_raw_batch(
+        kwargs: dict,
+        latents,
+        context,
+        context_mask,
+        audio_context,
+        audio_latents,
+        fps,
+    ):
+        """Unpack raw DiTDataCollator batch format into process_condition arguments."""
+        device = torch.device(get_device_type())
+
+        if "video_prompt_embeds" in kwargs:
+            video_features = kwargs.pop("video_prompt_embeds")
+            audio_features = kwargs.pop("audio_prompt_embeds", None)
+            prompt_mask = kwargs.pop("prompt_attention_mask", None)
+            latents_raw = kwargs.pop("latents", None)
+
+            if latents_raw is not None:
+                if isinstance(latents_raw, list) and len(latents_raw) > 0 and isinstance(latents_raw[0], dict):
+                    fps = [float(d.get("fps", 24)) for d in latents_raw]
+                    latents = [
+                        (d["latents"].unsqueeze(0) if d["latents"].dim() == 4 else d["latents"]).to(device)
+                        for d in latents_raw
+                    ]
+                elif isinstance(latents_raw, list):
+                    latents = [t.to(device) if isinstance(t, torch.Tensor) else t for t in latents_raw]
+                else:
+                    latents = latents_raw.to(device) if isinstance(latents_raw, torch.Tensor) else latents_raw
+
+            if isinstance(video_features, list):
+                context = [(f.unsqueeze(0) if f.dim() == 2 else f).to(device) for f in video_features]
+            else:
+                context = [video_features.to(device)]
+
+            if audio_features is not None:
+                if isinstance(audio_features, list):
+                    audio_context = [(f.unsqueeze(0) if f.dim() == 2 else f).to(device) for f in audio_features]
+                else:
+                    audio_context = [audio_features.to(device)]
+
+            if prompt_mask is not None:
+                if isinstance(prompt_mask, list):
+                    context_mask = [(m.unsqueeze(0) if m.dim() == 1 else m).to(device) for m in prompt_mask]
+                else:
+                    context_mask = [prompt_mask.to(device)]
+
+        elif "conditions" in kwargs:
+            conditions_raw = kwargs.pop("conditions")
+            audio_latents_raw = kwargs.pop("audio_latents", None)
+
+            if latents is not None and isinstance(latents, list) and len(latents) > 0:
+                if isinstance(latents[0], dict):
+                    fps = [float(d.get("fps", 24)) for d in latents]
+                    latents = [
+                        (d["latents"].unsqueeze(0) if d["latents"].dim() == 4 else d["latents"]).to(device)
+                        for d in latents
+                    ]
+                else:
+                    latents = [t.to(device) if isinstance(t, torch.Tensor) else t for t in latents]
+
+            first_cond = conditions_raw[0]
+            if isinstance(first_cond, dict) and "video_prompt_embeds" in first_cond:
+                video_features = [c["video_prompt_embeds"] for c in conditions_raw]
+                context = [(f.unsqueeze(0) if f.dim() == 2 else f).to(device) for f in video_features]
+                audio_features_list = [c.get("audio_prompt_embeds") for c in conditions_raw]
+                if any(a is not None for a in audio_features_list):
+                    audio_context = [
+                        (f.unsqueeze(0) if f.dim() == 2 else f).to(device)
+                        for f in audio_features_list
+                        if f is not None
+                    ]
+                prompt_mask_list = [c.get("prompt_attention_mask") for c in conditions_raw]
+                if any(m is not None for m in prompt_mask_list):
+                    context_mask = [
+                        (m.unsqueeze(0) if m.dim() == 1 else m).to(device) for m in prompt_mask_list if m is not None
+                    ]
+            elif isinstance(first_cond, dict):
+                context = [
+                    c.get("last_hidden_state", next(iter(c.values()))).unsqueeze(0).to(device) for c in conditions_raw
+                ]
+            elif isinstance(first_cond, torch.Tensor):
+                context = [(c.unsqueeze(0) if c.dim() == 2 else c).to(device) for c in conditions_raw]
+
+            if audio_latents_raw is not None:
+                if isinstance(audio_latents_raw, list) and len(audio_latents_raw) > 0:
+                    if isinstance(audio_latents_raw[0], dict):
+                        audio_latents = [
+                            (d["latents"].unsqueeze(0) if d["latents"].dim() == 3 else d["latents"]).to(device)
+                            for d in audio_latents_raw
+                        ]
+                    else:
+                        audio_latents = [
+                            (t.to(device) if isinstance(t, torch.Tensor) else t) for t in audio_latents_raw
+                        ]
+
+        return latents, context, context_mask, audio_context, audio_latents, fps
 
     def _create_first_frame_conditioning_mask(
         self,

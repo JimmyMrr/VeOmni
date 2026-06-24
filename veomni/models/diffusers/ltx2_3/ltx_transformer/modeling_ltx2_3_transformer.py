@@ -125,12 +125,8 @@ def LTXVideoModel_forward(
         video_args_x = slice_input_tensor(video_args.x, dim=1, group=get_parallel_state().sp_group)
 
         cos_freq, sin_freq = video_args.positional_embeddings
-        ulysses_size = get_parallel_state().ulysses_size
-        ulysses_rank = get_parallel_state().ulysses_rank
-        seq_len = cos_freq.shape[2]
-        chunk = seq_len // ulysses_size
-        cos_freq = cos_freq[:, :, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
-        sin_freq = sin_freq[:, :, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
+        cos_freq = slice_input_tensor(cos_freq, dim=2, group=get_parallel_state().sp_group)
+        sin_freq = slice_input_tensor(sin_freq, dim=2, group=get_parallel_state().sp_group)
         positional_embeddings = (cos_freq, sin_freq)
 
         sp_kwargs = dict(x=video_args_x, positional_embeddings=positional_embeddings)
@@ -151,12 +147,8 @@ def LTXVideoModel_forward(
         audio_args_x = slice_input_tensor(audio_args.x, dim=1, group=get_parallel_state().sp_group)
 
         cos_freq, sin_freq = audio_args.positional_embeddings
-        ulysses_size = get_parallel_state().ulysses_size
-        ulysses_rank = get_parallel_state().ulysses_rank
-        seq_len = cos_freq.shape[2]
-        chunk = seq_len // ulysses_size
-        cos_freq = cos_freq[:, :, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
-        sin_freq = sin_freq[:, :, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
+        cos_freq = slice_input_tensor(cos_freq, dim=2, group=get_parallel_state().sp_group)
+        sin_freq = slice_input_tensor(sin_freq, dim=2, group=get_parallel_state().sp_group)
         positional_embeddings = (cos_freq, sin_freq)
 
         sp_kwargs = dict(x=audio_args_x, positional_embeddings=positional_embeddings)
@@ -207,6 +199,7 @@ def LTXVideoModel_forward(
 
 @dataclass
 class LTXVideoModelOutput(ModelOutput):
+    loss: dict[str, torch.Tensor] | None = None
     predictions: list[torch.FloatTensor] | None = None
     audio_predictions: list[torch.FloatTensor] | None = None
 
@@ -324,6 +317,8 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
         audio_encoder_hidden_states: list[torch.Tensor] | None = None,
         audio_loss_mask: list[torch.Tensor] | None = None,
         fps: list[float] | None = None,
+        training_target: list[torch.Tensor] | None = None,
+        audio_training_target: list[torch.Tensor] | None = None,
     ):
         video_patchifier = VideoLatentPatchifier(patch_size=1)
         audio_patchifier = AudioPatchifier(patch_size=1) if self.config.with_audio else None
@@ -421,7 +416,20 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
                 audio_pred = audio_patchifier.unpatchify(ax, audio_latent_shape)
                 audio_predictions.append(audio_pred)
 
+        loss = None
+        if training_target is not None:
+            loss_val, loss_dict = compute_ltx2_loss(
+                predictions,
+                training_target,
+                video_loss_mask,
+                audio_predictions=audio_predictions if audio_predictions else None,
+                audio_training_targets=audio_training_target,
+                audio_loss_masks=audio_loss_mask,
+            )
+            loss = loss_dict
+
         return LTXVideoModelOutput(
+            loss=loss,
             predictions=predictions,
             audio_predictions=audio_predictions if audio_predictions else None,
         )
@@ -450,6 +458,50 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
         config = get_model_config(path, **kwargs)
         model = cls._from_config(config)
         return model
+
+
+def compute_ltx2_loss(
+    predictions: list[torch.Tensor],
+    training_targets: list[torch.Tensor],
+    video_loss_masks: list[torch.Tensor] | None,
+    audio_predictions: list[torch.Tensor] | None = None,
+    audio_training_targets: list[torch.Tensor] | None = None,
+    audio_loss_masks: list[torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    per_sample_losses = []
+
+    for i, (prediction, target) in enumerate(zip(predictions, training_targets)):
+        prediction = prediction.to(dtype=torch.float32)
+        target = target.to(dtype=torch.float32)
+        per_element_loss = (prediction - target).pow(2)
+
+        B, C, F, H, W = prediction.shape
+
+        sample_vlm = None
+        if video_loss_masks is not None and i < len(video_loss_masks):
+            sample_vlm = video_loss_masks[i]
+
+        if sample_vlm is not None:
+            sample_vlm = sample_vlm.to(device=prediction.device, dtype=torch.bool)
+            loss_mask = sample_vlm.view(1, 1, F, H, W).float()
+            masked_loss = per_element_loss * loss_mask
+            valid_count = loss_mask.reshape(1, 1, -1).sum(dim=-1).clamp(min=1e-8)
+            per_sample_loss = masked_loss.reshape(B, C, -1).sum(dim=-1).mean(dim=-1) / valid_count
+        else:
+            per_sample_loss = per_element_loss.reshape(B, -1).mean(dim=1)
+
+        if audio_predictions is not None and audio_training_targets is not None and i < len(audio_predictions):
+            audio_pred = audio_predictions[i].to(dtype=torch.float32)
+            audio_target = audio_training_targets[i].to(dtype=torch.float32)
+            audio_loss = (audio_pred - audio_target).pow(2).mean(dim=tuple(range(1, audio_pred.dim())))
+            per_sample_loss = per_sample_loss + audio_loss
+
+        per_sample_losses.append(per_sample_loss)
+
+    loss = torch.stack(per_sample_losses).mean()
+    loss_dict = {"mse_loss": loss}
+    total_loss = torch.stack(list(loss_dict.values())).sum()
+    return total_loss, loss_dict
 
 
 def apply_veomni_ltx_transformer_patch() -> None:
