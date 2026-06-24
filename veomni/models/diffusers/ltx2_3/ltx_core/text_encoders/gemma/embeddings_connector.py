@@ -137,11 +137,32 @@ class Embeddings1DConnector(torch.nn.Module):
         Returns:
             (hidden_states, additive_attention_mask)
         """
+        import os as _os
+
+        _dbg = _os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1"
+
         self.to(hidden_states.device)
 
         if self.num_learnable_registers:
+            if _dbg:
+                lr = self.learnable_registers
+                print(
+                    f"[LTX-2 conn] learnable_registers: shape={list(lr.shape)}, "
+                    f"dtype={lr.dtype}, mean={lr.float().mean():.8f}, std={lr.float().std():.8f}"
+                )
+                binary = additive_attention_mask[:, 0, 0, :] >= 0
+                print(
+                    f"[LTX-2 conn] additive_mask_binary_sum={binary.sum().item()}, "
+                    f"additive_mask_shape={list(additive_attention_mask.shape)}"
+                )
             hidden_states, additive_attention_mask = self._replace_padded_with_learnable_registers(
                 hidden_states, additive_attention_mask
+            )
+
+        if _dbg:
+            print(
+                f"[LTX-2 conn] after_registers: mean={hidden_states.float().mean():.8f}, "
+                f"std={hidden_states.float().std():.8f}"
             )
 
         indices_grid = torch.arange(hidden_states.shape[1], dtype=torch.float32, device=hidden_states.device)
