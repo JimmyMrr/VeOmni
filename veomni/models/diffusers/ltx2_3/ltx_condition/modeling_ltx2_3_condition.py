@@ -337,11 +337,16 @@ def _load_transformer_config(checkpoint_path: str) -> dict:
     else:
         safetensor_files = []
 
+    logger.info_rank0(f"Searching safetensors in {ckpt_path}, found: {[str(p) for p in safetensor_files]}")
+
     for sf_path in safetensor_files:
         with safe_open(str(sf_path), framework="pt", device="cpu") as f:
             meta = f.metadata()
+            logger.info_rank0(f"Safetensors {sf_path.name} metadata keys: {list(meta.keys()) if meta else 'None'}")
             if meta and "config" in meta:
-                return json.loads(meta["config"])
+                config = json.loads(meta["config"])
+                logger.info_rank0(f"Loaded config from safetensors metadata, keys: {sorted(config.keys())}")
+                return config
 
     config_candidates = [
         ckpt_path / "transformer" / "config.json",
@@ -381,10 +386,11 @@ class LTXVideoConditionModel(PreTrainedModel):
 
         transformer_config = _load_transformer_config(base)
 
-        logger.info_rank0(f"VeOmni transformer_config keys: {sorted(transformer_config.keys())}")
-        logger.info_rank0(f"VeOmni connector_apply_gated_attention: {transformer_config.get('connector_apply_gated_attention', 'NOT_SET')}")
-        logger.info_rank0(f"VeOmni connector_num_attention_heads: {transformer_config.get('connector_num_attention_heads', 'NOT_SET')}")
-        logger.info_rank0(f"VeOmni audio_connector_num_attention_heads: {transformer_config.get('audio_connector_num_attention_heads', 'NOT_SET')}")
+        _tc = transformer_config.get("transformer", transformer_config)
+        logger.info_rank0(f"VeOmni transformer sub-dict keys: {sorted(_tc.keys())}")
+        logger.info_rank0(f"VeOmni connector_apply_gated_attention: {_tc.get('connector_apply_gated_attention', 'NOT_SET')}")
+        logger.info_rank0(f"VeOmni connector_num_attention_heads: {_tc.get('connector_num_attention_heads', 'NOT_SET')}")
+        logger.info_rank0(f"VeOmni audio_connector_num_attention_heads: {_tc.get('audio_connector_num_attention_heads', 'NOT_SET')}")
 
         connector_dims = _infer_connector_dims_from_checkpoint(base)
         if connector_dims:
@@ -651,6 +657,10 @@ class LTXVideoConditionModel(PreTrainedModel):
                     f"dtype={sample_features.dtype}, mean={sample_features.float().mean():.8f}, "
                     f"std={sample_features.float().std():.8f}"
                 )
+                print(f"[LTX-2 CP0] with_audio={self.config.with_audio}, "
+                      f"audio_context_is_none={audio_context is None}, "
+                      f"sample_audio_features_is_none={sample_audio_features is None}, "
+                      f"audio_connector_is_none={self.embeddings_processor.audio_connector is None}")
                 if sample_audio_features is not None:
                     print(
                         f"[LTX-2 CP0] audio_features: shape={list(sample_audio_features.shape)}, "

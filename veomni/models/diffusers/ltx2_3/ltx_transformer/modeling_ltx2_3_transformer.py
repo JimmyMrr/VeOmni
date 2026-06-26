@@ -338,6 +338,10 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
             latent_tokens = video_patchifier.patchify(hidden_state)
             num_tokens = latent_tokens.shape[1]
 
+            if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
+                print(f"[LTX-2 CP3.1] latent_tokens: shape={list(latent_tokens.shape)}, "
+                      f"mean={latent_tokens.float().mean().item():.8f}, std={latent_tokens.float().std().item():.8f}")
+
             sigma = ts
             if sigma.ndim == 0:
                 sigma = sigma.unsqueeze(0)
@@ -353,11 +357,19 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
             else:
                 timesteps = sigma.unsqueeze(1).expand(1, num_tokens)
 
+            if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
+                print(f"[LTX-2 CP3.2] timesteps: shape={list(timesteps.shape)}, "
+                      f"mean={timesteps.float().mean().item():.8f}, std={timesteps.float().std().item():.8f}")
+
             latent_coords = video_patchifier.get_patch_grid_bounds(latent_shape, device=hidden_state.device)
             positions = get_pixel_coords(latent_coords, VIDEO_SCALE_FACTORS, causal_fix=True)
             positions = positions.to(device=model_device, dtype=compute_dtype)
             sample_fps = fps[sample_idx] if fps is not None else DEFAULT_FPS
             positions[:, 0, ...] = positions[:, 0, ...] / sample_fps
+
+            if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
+                print(f"[LTX-2 CP3.3] positions: shape={list(positions.shape)}, "
+                      f"mean={positions.float().mean().item():.8f}, std={positions.float().std().item():.8f}")
 
             sample_ctx_mask = context_mask[sample_idx] if context_mask is not None else None
             if sample_ctx_mask is not None:
@@ -371,6 +383,15 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
                 context=enc_hs,
                 context_mask=sample_ctx_mask,
             )
+
+            if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
+                print(f"[LTX-2 CP3.4] video_modality.latent: shape={list(video_modality.latent.shape)}, "
+                      f"mean={video_modality.latent.float().mean().item():.8f}, std={video_modality.latent.float().std().item():.8f}")
+                print(f"[LTX-2 CP3.4] video_modality.context: shape={list(video_modality.context.shape)}, "
+                      f"mean={video_modality.context.float().mean().item():.8f}, std={video_modality.context.float().std().item():.8f}")
+                print(f"[LTX-2 CP3.4] video_modality.sigma: {video_modality.sigma}")
+                print(f"[LTX-2 CP3.4] video_modality.timesteps: shape={list(video_modality.timesteps.shape)}, "
+                      f"mean={video_modality.timesteps.float().mean().item():.8f}")
 
             audio_modality = None
             if self.config.with_audio and audio_hidden_states is not None and audio_timestep is not None:
@@ -407,7 +428,20 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
 
             perturbations = BatchedPerturbationConfig.empty(1)
 
+            if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
+                print(f"[LTX-2 CP3.5] Before LTXModel.forward, audio_modality={'None' if audio_modality is None else 'present'}")
+
             vx, ax = LTXModel.forward(self, video=video_modality, audio=audio_modality, perturbations=perturbations)
+
+            if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
+                if vx is not None:
+                    print(f"[LTX-2 CP3.6] After LTXModel.forward, vx: shape={list(vx.shape)}, "
+                          f"mean={vx.float().mean().item():.8f}, std={vx.float().std().item():.8f}")
+                else:
+                    print(f"[LTX-2 CP3.6] After LTXModel.forward, vx: None")
+                if ax is not None:
+                    print(f"[LTX-2 CP3.6] After LTXModel.forward, ax: shape={list(ax.shape)}, "
+                          f"mean={ax.float().mean().item():.8f}, std={ax.float().std().item():.8f}")
 
             prediction = video_patchifier.unpatchify(vx, latent_shape)
             predictions.append(prediction)
@@ -490,10 +524,15 @@ def compute_ltx2_loss(
         else:
             per_sample_loss = per_element_loss.reshape(B, -1).mean(dim=1)
 
+        if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
+            print(f"[LTX-2 CP4] video_loss={per_sample_loss.mean().item():.8f}, dtype={per_sample_loss.dtype}")
+
         if audio_predictions is not None and audio_training_targets is not None and i < len(audio_predictions):
             audio_pred = audio_predictions[i].to(dtype=torch.float32)
             audio_target = audio_training_targets[i].to(dtype=torch.float32)
             audio_loss = (audio_pred - audio_target).pow(2).mean(dim=tuple(range(1, audio_pred.dim())))
+            if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
+                print(f"[LTX-2 CP4] audio_loss={audio_loss.mean().item():.8f}")
             per_sample_loss = per_sample_loss + audio_loss
 
         per_sample_losses.append(per_sample_loss)
@@ -508,3 +547,5 @@ def apply_veomni_ltx_transformer_patch() -> None:
     Attention.forward = LTXSPAttention_forward
     LTXModel.forward = LTXVideoModel_forward
     logger.info_rank0("Applied VeOmni SP patch to LTXModel.forward and Attention.forward.")
+    if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
+        print("[LTX-2 PATCH] VeOmni patches applied: LTXModel.forward -> LTXVideoModel_forward, Attention.forward -> LTXSPAttention_forward")
