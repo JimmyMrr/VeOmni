@@ -143,6 +143,14 @@ class Embeddings1DConnector(torch.nn.Module):
 
         self.to(hidden_states.device)
 
+        if _dbg:
+            for i, block in enumerate(self.transformer_1d_blocks):
+                for name, param in block.named_parameters():
+                    print(
+                        f"[LTX-2 conn] weight block_{i}.{name}: shape={list(param.shape)}, "
+                        f"mean={param.float().mean():.8f}, std={param.float().std():.8f}"
+                    )
+
         if self.num_learnable_registers:
             if _dbg:
                 lr = self.learnable_registers
@@ -179,10 +187,28 @@ class Embeddings1DConnector(torch.nn.Module):
             freq_grid_generator=freq_grid_generator,
         )
 
-        for block in self.transformer_1d_blocks:
+        if _dbg:
+            cos_freq, sin_freq = freqs_cis
+            print(
+                f"[LTX-2 conn] rope_cos: mean={cos_freq.float().mean():.8f}, "
+                f"rope_sin: mean={sin_freq.float().mean():.8f}"
+            )
+
+        for i, block in enumerate(self.transformer_1d_blocks):
             hidden_states = block(hidden_states, additive_attention_mask=additive_attention_mask, pe=freqs_cis)
+            if _dbg:
+                print(
+                    f"[LTX-2 conn] block_{i}: mean={hidden_states.float().mean():.8f}, "
+                    f"std={hidden_states.float().std():.8f}"
+                )
 
         hidden_states = rms_norm(hidden_states)
+
+        if _dbg:
+            print(
+                f"[LTX-2 conn] after_rmsnorm: mean={hidden_states.float().mean():.8f}, "
+                f"std={hidden_states.float().std():.8f}"
+            )
 
         return hidden_states, additive_attention_mask
 

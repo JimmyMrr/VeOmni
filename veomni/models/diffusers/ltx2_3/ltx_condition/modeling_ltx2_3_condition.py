@@ -360,6 +360,11 @@ class LTXVideoConditionModel(PreTrainedModel):
 
         transformer_config = _load_transformer_config(base)
 
+        logger.info_rank0(f"VeOmni transformer_config keys: {sorted(transformer_config.keys())}")
+        logger.info_rank0(f"VeOmni connector_apply_gated_attention: {transformer_config.get('connector_apply_gated_attention', 'NOT_SET')}")
+        logger.info_rank0(f"VeOmni connector_num_attention_heads: {transformer_config.get('connector_num_attention_heads', 'NOT_SET')}")
+        logger.info_rank0(f"VeOmni audio_connector_num_attention_heads: {transformer_config.get('audio_connector_num_attention_heads', 'NOT_SET')}")
+
         connector_dims = _infer_connector_dims_from_checkpoint(base)
         if connector_dims:
             logger.info_rank0(
@@ -375,6 +380,10 @@ class LTXVideoConditionModel(PreTrainedModel):
         )
 
         _create_input_projections(self.embeddings_processor, device=device, dtype=torch.bfloat16, fe_dims=fe_dims)
+
+        logger.info_rank0(f"VeOmni connector inner_dim={self.embeddings_processor.video_connector.inner_dim}, "
+                          f"heads={self.embeddings_processor.video_connector.num_attention_heads}, "
+                          f"video_input_proj={self.embeddings_processor.video_input_proj is not None}")
 
         self.embeddings_processor = self.embeddings_processor.to(device=device, dtype=torch.bfloat16)
 
@@ -575,7 +584,7 @@ class LTXVideoConditionModel(PreTrainedModel):
             self._timesteps_ready = True
 
         device = latents[0].device
-        compute_dtype = torch.float32
+        compute_dtype = latents[0].dtype
 
         packed_conditions: dict[str, list] = {
             "hidden_states": [],
