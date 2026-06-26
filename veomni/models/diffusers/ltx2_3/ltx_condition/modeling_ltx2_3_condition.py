@@ -320,8 +320,29 @@ def _create_input_projections(
 
 
 def _load_transformer_config(checkpoint_path: str) -> dict:
-    """Load transformer config JSON from checkpoint directory for connector config."""
+    """Load transformer config from checkpoint.
+
+    Priority:
+    1. Safetensors metadata (contains full config including connector fields)
+    2. Fallback to config.json files in checkpoint directory
+    """
+    from safetensors import safe_open
+
     ckpt_path = Path(checkpoint_path)
+
+    if ckpt_path.is_dir():
+        safetensor_files = sorted(ckpt_path.glob("*.safetensors"))
+    elif ckpt_path.suffix == ".safetensors":
+        safetensor_files = [ckpt_path]
+    else:
+        safetensor_files = []
+
+    for sf_path in safetensor_files:
+        with safe_open(str(sf_path), framework="pt", device="cpu") as f:
+            meta = f.metadata()
+            if meta and "config" in meta:
+                return json.loads(meta["config"])
+
     config_candidates = [
         ckpt_path / "transformer" / "config.json",
         ckpt_path / "config.json",
@@ -335,7 +356,7 @@ def _load_transformer_config(checkpoint_path: str) -> dict:
             with open(candidate) as f:
                 return json.load(f)
 
-    raise FileNotFoundError(f"No config.json found near {checkpoint_path}")
+    raise FileNotFoundError(f"No config found near {checkpoint_path}")
 
 
 class LTXVideoConditionModel(PreTrainedModel):
