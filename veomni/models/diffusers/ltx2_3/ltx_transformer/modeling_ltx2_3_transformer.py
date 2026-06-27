@@ -118,8 +118,58 @@ def LTXVideoModel_forward(
     audio: Modality | None,
     perturbations: BatchedPerturbationConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    _dbg = os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1"
+
+    if _dbg:
+        _param_dtype = next(self.parameters()).dtype
+        _gc = getattr(self, "gradient_checkpointing", None)
+        _gc2 = getattr(self, "_enable_gradient_checkpointing", None)
+        print(
+            f"[LTX-2 CP3.6-pre] param_dtype={_param_dtype}, "
+            f"gradient_checkpointing={_gc}, _enable_gradient_checkpointing={_gc2}, "
+            f"training={self.training}, sp_enabled={get_parallel_state().sp_enabled}"
+        )
+        if video is not None:
+            print(
+                f"[LTX-2 CP3.6-pre] video.latent.dtype={video.latent.dtype}, "
+                f"video.context.dtype={video.context.dtype}, "
+                f"video.timesteps.dtype={video.timesteps.dtype}, "
+                f"video.positions.dtype={video.positions.dtype}"
+            )
+
     video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
     audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
+
+    if _dbg and video_args is not None:
+        print(
+            f"[LTX-2 CP3.6a] After preprocessor: x.dtype={video_args.x.dtype}, "
+            f"x: shape={list(video_args.x.shape)}, "
+            f"mean={video_args.x.float().mean().item():.8f}, std={video_args.x.float().std().item():.8f}"
+        )
+        print(
+            f"[LTX-2 CP3.6a] context.dtype={video_args.context.dtype}, "
+            f"context: mean={video_args.context.float().mean().item():.8f}, "
+            f"std={video_args.context.float().std().item():.8f}"
+        )
+        print(
+            f"[LTX-2 CP3.6a] embedded_timestep.dtype={video_args.embedded_timestep.dtype}, "
+            f"embedded_timestep: mean={video_args.embedded_timestep.float().mean().item():.8f}, "
+            f"std={video_args.embedded_timestep.float().std().item():.8f}"
+        )
+        cos_freq, sin_freq = video_args.positional_embeddings
+        print(
+            f"[LTX-2 CP3.6a] cos_freq.dtype={cos_freq.dtype}, "
+            f"cos_freq: mean={cos_freq.float().mean().item():.8f}, "
+            f"sin_freq: mean={sin_freq.float().mean().item():.8f}"
+        )
+        if video_args.context_mask is not None:
+            print(
+                f"[LTX-2 CP3.6a] context_mask.dtype={video_args.context_mask.dtype}, "
+                f"shape={list(video_args.context_mask.shape)}, "
+                f"sum={video_args.context_mask.float().sum().item():.2f}"
+            )
+        else:
+            print("[LTX-2 CP3.6a] context_mask=None")
 
     if get_parallel_state().sp_enabled and video_args is not None:
         video_args_x = slice_input_tensor(video_args.x, dim=1, group=get_parallel_state().sp_group)
@@ -171,6 +221,18 @@ def LTXVideoModel_forward(
         perturbations=perturbations,
     )
 
+    if _dbg and video_out is not None:
+        print(
+            f"[LTX-2 CP3.6b] After transformer blocks: x.dtype={video_out.x.dtype}, "
+            f"x: shape={list(video_out.x.shape)}, "
+            f"mean={video_out.x.float().mean().item():.8f}, std={video_out.x.float().std().item():.8f}"
+        )
+        print(
+            f"[LTX-2 CP3.6b] embedded_timestep.dtype={video_out.embedded_timestep.dtype}, "
+            f"embedded_timestep: mean={video_out.embedded_timestep.float().mean().item():.8f}, "
+            f"std={video_out.embedded_timestep.float().std().item():.8f}"
+        )
+
     if get_parallel_state().sp_enabled and video_out is not None:
         video_out = replace(video_out, x=gather_outputs(video_out.x, gather_dim=1))
     if get_parallel_state().sp_enabled and audio_out is not None:
@@ -183,6 +245,18 @@ def LTXVideoModel_forward(
         if video_out is not None
         else None
     )
+
+    if _dbg and vx is not None:
+        print(
+            f"[LTX-2 CP3.6c] After _process_output: vx.dtype={vx.dtype}, "
+            f"vx: shape={list(vx.shape)}, "
+            f"mean={vx.float().mean().item():.8f}, std={vx.float().std().item():.8f}"
+        )
+        print(
+            f"[LTX-2 CP3.6c] scale_shift_table.dtype={self.scale_shift_table.dtype}, "
+            f"norm_out.weight.dtype={self.norm_out.weight.dtype if self.norm_out.weight is not None else 'None'}"
+        )
+
     ax = (
         self._process_output(
             self.audio_scale_shift_table,
@@ -327,11 +401,18 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
 
         model_device = next(self.parameters()).device
         compute_dtype = next(self.parameters()).dtype
+        fsdp_param_dtype = self.patchify_proj.weight.dtype
+
+        if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
+            print(
+                f"[LTX-2 CP3.0] model_device={model_device}, compute_dtype={compute_dtype}, "
+                f"fsdp_param_dtype={fsdp_param_dtype}"
+            )
 
         for sample_idx, (hidden_state, ts, enc_hs) in enumerate(zip(hidden_states, timestep, encoder_hidden_states)):
-            hidden_state = hidden_state.to(device=model_device, dtype=compute_dtype)
-            ts = ts.to(device=model_device, dtype=compute_dtype)
-            enc_hs = enc_hs.to(device=model_device, dtype=compute_dtype)
+            hidden_state = hidden_state.to(device=model_device, dtype=fsdp_param_dtype)
+            ts = ts.to(device=model_device, dtype=fsdp_param_dtype)
+            enc_hs = enc_hs.to(device=model_device, dtype=fsdp_param_dtype)
 
             latent_shape = VideoLatentShape.from_torch_shape(hidden_state.shape)
 
@@ -339,8 +420,10 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
             num_tokens = latent_tokens.shape[1]
 
             if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
-                print(f"[LTX-2 CP3.1] latent_tokens: shape={list(latent_tokens.shape)}, "
-                      f"mean={latent_tokens.float().mean().item():.8f}, std={latent_tokens.float().std().item():.8f}")
+                print(
+                    f"[LTX-2 CP3.1] latent_tokens: shape={list(latent_tokens.shape)}, "
+                    f"mean={latent_tokens.float().mean().item():.8f}, std={latent_tokens.float().std().item():.8f}"
+                )
 
             sigma = ts
             if sigma.ndim == 0:
@@ -352,28 +435,32 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
                 timesteps = torch.where(
                     sample_vlm.unsqueeze(0),
                     sigma.unsqueeze(1).expand(1, num_tokens),
-                    torch.zeros(1, num_tokens, device=sigma.device, dtype=compute_dtype),
+                    torch.zeros(1, num_tokens, device=sigma.device, dtype=fsdp_param_dtype),
                 )
             else:
                 timesteps = sigma.unsqueeze(1).expand(1, num_tokens)
 
             if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
-                print(f"[LTX-2 CP3.2] timesteps: shape={list(timesteps.shape)}, "
-                      f"mean={timesteps.float().mean().item():.8f}, std={timesteps.float().std().item():.8f}")
+                print(
+                    f"[LTX-2 CP3.2] timesteps: shape={list(timesteps.shape)}, "
+                    f"mean={timesteps.float().mean().item():.8f}, std={timesteps.float().std().item():.8f}"
+                )
 
             latent_coords = video_patchifier.get_patch_grid_bounds(latent_shape, device=hidden_state.device)
             positions = get_pixel_coords(latent_coords, VIDEO_SCALE_FACTORS, causal_fix=True)
-            positions = positions.to(device=model_device, dtype=compute_dtype)
+            positions = positions.to(device=model_device, dtype=fsdp_param_dtype)
             sample_fps = fps[sample_idx] if fps is not None else DEFAULT_FPS
             positions[:, 0, ...] = positions[:, 0, ...] / sample_fps
 
             if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
-                print(f"[LTX-2 CP3.3] positions: shape={list(positions.shape)}, "
-                      f"mean={positions.float().mean().item():.8f}, std={positions.float().std().item():.8f}")
+                print(
+                    f"[LTX-2 CP3.3] positions: shape={list(positions.shape)}, "
+                    f"mean={positions.float().mean().item():.8f}, std={positions.float().std().item():.8f}"
+                )
 
             sample_ctx_mask = context_mask[sample_idx] if context_mask is not None else None
             if sample_ctx_mask is not None:
-                sample_ctx_mask = sample_ctx_mask.to(device=model_device, dtype=compute_dtype)
+                sample_ctx_mask = sample_ctx_mask.to(device=model_device, dtype=fsdp_param_dtype)
 
             video_modality = Modality(
                 latent=latent_tokens,
@@ -385,20 +472,26 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
             )
 
             if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
-                print(f"[LTX-2 CP3.4] video_modality.latent: shape={list(video_modality.latent.shape)}, "
-                      f"mean={video_modality.latent.float().mean().item():.8f}, std={video_modality.latent.float().std().item():.8f}")
-                print(f"[LTX-2 CP3.4] video_modality.context: shape={list(video_modality.context.shape)}, "
-                      f"mean={video_modality.context.float().mean().item():.8f}, std={video_modality.context.float().std().item():.8f}")
+                print(
+                    f"[LTX-2 CP3.4] video_modality.latent: shape={list(video_modality.latent.shape)}, "
+                    f"mean={video_modality.latent.float().mean().item():.8f}, std={video_modality.latent.float().std().item():.8f}"
+                )
+                print(
+                    f"[LTX-2 CP3.4] video_modality.context: shape={list(video_modality.context.shape)}, "
+                    f"mean={video_modality.context.float().mean().item():.8f}, std={video_modality.context.float().std().item():.8f}"
+                )
                 print(f"[LTX-2 CP3.4] video_modality.sigma: {video_modality.sigma}")
-                print(f"[LTX-2 CP3.4] video_modality.timesteps: shape={list(video_modality.timesteps.shape)}, "
-                      f"mean={video_modality.timesteps.float().mean().item():.8f}")
+                print(
+                    f"[LTX-2 CP3.4] video_modality.timesteps: shape={list(video_modality.timesteps.shape)}, "
+                    f"mean={video_modality.timesteps.float().mean().item():.8f}"
+                )
 
             audio_modality = None
             if self.config.with_audio and audio_hidden_states is not None and audio_timestep is not None:
                 sample_audio_hs = audio_hidden_states[sample_idx]
                 sample_audio_ts = audio_timestep[sample_idx]
-                sample_audio_hs = sample_audio_hs.to(device=model_device, dtype=compute_dtype)
-                sample_audio_ts = sample_audio_ts.to(device=model_device, dtype=compute_dtype)
+                sample_audio_hs = sample_audio_hs.to(device=model_device, dtype=fsdp_param_dtype)
+                sample_audio_ts = sample_audio_ts.to(device=model_device, dtype=fsdp_param_dtype)
 
                 audio_latent_shape = AudioLatentShape.from_torch_shape(sample_audio_hs.shape)
                 audio_tokens = audio_patchifier.patchify(sample_audio_hs)
@@ -410,12 +503,12 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
                 audio_timesteps_per_token = audio_sigma.unsqueeze(1).expand(1, audio_num_tokens)
 
                 audio_coords = audio_patchifier.get_patch_grid_bounds(audio_latent_shape, device=model_device)
-                audio_positions = audio_coords.to(device=model_device, dtype=compute_dtype)
+                audio_positions = audio_coords.to(device=model_device, dtype=fsdp_param_dtype)
 
                 audio_enc_hs = (
                     audio_encoder_hidden_states[sample_idx] if audio_encoder_hidden_states is not None else enc_hs
                 )
-                audio_enc_hs = audio_enc_hs.to(device=model_device, dtype=compute_dtype)
+                audio_enc_hs = audio_enc_hs.to(device=model_device, dtype=fsdp_param_dtype)
 
                 audio_modality = Modality(
                     latent=audio_tokens,
@@ -429,19 +522,25 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
             perturbations = BatchedPerturbationConfig.empty(1)
 
             if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
-                print(f"[LTX-2 CP3.5] Before LTXModel.forward, audio_modality={'None' if audio_modality is None else 'present'}")
+                print(
+                    f"[LTX-2 CP3.5] Before LTXModel.forward, audio_modality={'None' if audio_modality is None else 'present'}"
+                )
 
             vx, ax = LTXModel.forward(self, video=video_modality, audio=audio_modality, perturbations=perturbations)
 
             if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
                 if vx is not None:
-                    print(f"[LTX-2 CP3.6] After LTXModel.forward, vx: shape={list(vx.shape)}, "
-                          f"mean={vx.float().mean().item():.8f}, std={vx.float().std().item():.8f}")
+                    print(
+                        f"[LTX-2 CP3.6] After LTXModel.forward, vx: shape={list(vx.shape)}, "
+                        f"mean={vx.float().mean().item():.8f}, std={vx.float().std().item():.8f}"
+                    )
                 else:
-                    print(f"[LTX-2 CP3.6] After LTXModel.forward, vx: None")
+                    print("[LTX-2 CP3.6] After LTXModel.forward, vx: None")
                 if ax is not None:
-                    print(f"[LTX-2 CP3.6] After LTXModel.forward, ax: shape={list(ax.shape)}, "
-                          f"mean={ax.float().mean().item():.8f}, std={ax.float().std().item():.8f}")
+                    print(
+                        f"[LTX-2 CP3.6] After LTXModel.forward, ax: shape={list(ax.shape)}, "
+                        f"mean={ax.float().mean().item():.8f}, std={ax.float().std().item():.8f}"
+                    )
 
             prediction = video_patchifier.unpatchify(vx, latent_shape)
             predictions.append(prediction)
@@ -548,4 +647,6 @@ def apply_veomni_ltx_transformer_patch() -> None:
     LTXModel.forward = LTXVideoModel_forward
     logger.info_rank0("Applied VeOmni SP patch to LTXModel.forward and Attention.forward.")
     if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
-        print("[LTX-2 PATCH] VeOmni patches applied: LTXModel.forward -> LTXVideoModel_forward, Attention.forward -> LTXSPAttention_forward")
+        print(
+            "[LTX-2 PATCH] VeOmni patches applied: LTXModel.forward -> LTXVideoModel_forward, Attention.forward -> LTXSPAttention_forward"
+        )
