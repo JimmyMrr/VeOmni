@@ -253,6 +253,13 @@ class BasicAVTransformerBlock(torch.nn.Module):
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
+        import os as _os
+
+        _dbg = _os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1"
+        _block_counter = getattr(self.__class__, "_debug_block_counter", 0)
+        _is_first_block = _dbg and _block_counter == 0
+        self.__class__._debug_block_counter = _block_counter + 1
+
         if video is None and audio is None:
             raise ValueError("At least one of video or audio must be provided")
 
@@ -266,11 +273,36 @@ class BasicAVTransformerBlock(torch.nn.Module):
         run_v2a = run_ax and (video is not None and vx.numel() > 0)
 
         if run_vx:
+            if _is_first_block:
+                with torch.no_grad():
+                    print(
+                        f"[LTX-2 BLOCK0] Before self-attn: vx mean={vx.float().mean().item():.8f}, std={vx.float().std().item():.8f}"
+                    )
+
             vshift_msa, vscale_msa, vgate_msa = self.get_ada_values(
                 self.scale_shift_table, vx.shape[0], video.timesteps, slice(0, 3)
             )
+
+            if _is_first_block:
+                with torch.no_grad():
+                    print(
+                        f"[LTX-2 BLOCK0] Ada values: vshift_msa mean={vshift_msa.float().mean().item():.8f}, "
+                        f"vscale_msa mean={vscale_msa.float().mean().item():.8f}, vgate_msa mean={vgate_msa.float().mean().item():.8f}"
+                    )
+
             norm_vx = self.ada_zero_function(vx, self.norm_eps, vscale_msa, vshift_msa)
             del vshift_msa, vscale_msa
+
+            if _is_first_block:
+                with torch.no_grad():
+                    print(
+                        f"[LTX-2 BLOCK0] After ada_zero: norm_vx mean={norm_vx.float().mean().item():.8f}, std={norm_vx.float().std().item():.8f}"
+                    )
+                    print(
+                        f"[LTX-2 BLOCK0] attn1 weights: to_q mean={self.attn1.to_q.weight.float().mean().item():.8f}, "
+                        f"to_k mean={self.attn1.to_k.weight.float().mean().item():.8f}, "
+                        f"to_v mean={self.attn1.to_v.weight.float().mean().item():.8f}"
+                    )
 
             vx_msa_out = self.attn1(
                 norm_vx,
@@ -279,8 +311,22 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 perturbation_mask=video.self_attn_perturbation_mask,
                 all_perturbed=video.self_attn_all_perturbed,
             )
+
+            if _is_first_block:
+                with torch.no_grad():
+                    print(
+                        f"[LTX-2 BLOCK0] Self-attn output: vx_msa_out mean={vx_msa_out.float().mean().item():.8f}, std={vx_msa_out.float().std().item():.8f}"
+                    )
+
             vx = vx + vx_msa_out * vgate_msa
             del vgate_msa, norm_vx, vx_msa_out
+
+            if _is_first_block:
+                with torch.no_grad():
+                    print(
+                        f"[LTX-2 BLOCK0] After self-attn: vx mean={vx.float().mean().item():.8f}, std={vx.float().std().item():.8f}"
+                    )
+
             vx = vx + self._apply_text_cross_attention(
                 vx,
                 video.context,
@@ -292,6 +338,12 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 video.context_mask,
                 cross_attention_adaln=self.cross_attention_adaln,
             )
+
+            if _is_first_block:
+                with torch.no_grad():
+                    print(
+                        f"[LTX-2 BLOCK0] After text cross-attn: vx mean={vx.float().mean().item():.8f}, std={vx.float().std().item():.8f}"
+                    )
 
         if run_ax:
             ashift_msa, ascale_msa, agate_msa = self.get_ada_values(
@@ -363,6 +415,12 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 )
                 del gate_out_a2v, a2v_vx_scaled, a2v_ax_scaled
 
+            if _is_first_block:
+                with torch.no_grad():
+                    print(
+                        f"[LTX-2 BLOCK0] After audio-video cross-attn: vx mean={vx.float().mean().item():.8f}, std={vx.float().std().item():.8f}"
+                    )
+
             if run_v2a and not audio.cross_attn_skip_all:
                 scale_ca_audio_v2a, shift_ca_audio_v2a, gate_out_v2a = self.get_av_ca_ada_values(
                     self.scale_shift_table_a2v_ca_audio,
@@ -407,6 +465,12 @@ class BasicAVTransformerBlock(torch.nn.Module):
             vx = vx + self.ff(vx_scaled) * vgate_mlp
 
             del vshift_mlp, vscale_mlp, vgate_mlp, vx_scaled
+
+            if _is_first_block:
+                with torch.no_grad():
+                    print(
+                        f"[LTX-2 BLOCK0] After FF: vx mean={vx.float().mean().item():.8f}, std={vx.float().std().item():.8f}"
+                    )
 
         if run_ax:
             ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(

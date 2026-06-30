@@ -28,11 +28,32 @@ class PytorchPreAttention(PreAttentionCallable):
         pe: torch.Tensor | None,
         k_pe: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        import os
+
+        _dbg = os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1"
+        _is_first = _dbg and not hasattr(self, "_printed_preattn")
+        if _is_first:
+            self._printed_preattn = True
+
         q = attn_module.q_norm(q)
         k = attn_module.k_norm(k)
+
+        if _is_first:
+            with torch.no_grad():
+                print(
+                    f"[LTX-2 PREATTN] after RMSNorm: q.mean={q.float().mean().item():.8f}, k.mean={k.float().mean().item():.8f}"
+                )
+
         if pe is not None:
             q = apply_rotary_emb(q, pe, attn_module.rope_type)
             k = apply_rotary_emb(k, pe if k_pe is None else k_pe, attn_module.rope_type)
+
+            if _is_first:
+                with torch.no_grad():
+                    print(
+                        f"[LTX-2 PREATTN] after RoPE: q.mean={q.float().mean().item():.8f}, k.mean={k.float().mean().item():.8f}"
+                    )
+
         return q, k
 
 
