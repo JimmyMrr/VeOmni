@@ -157,12 +157,26 @@ def _load_transformer_config(checkpoint_path: str) -> dict:
             if meta and "config" in meta:
                 config = json.loads(meta["config"])
                 logger.info_rank0(f"Loaded config from safetensors metadata, keys: {sorted(config.keys())}")
+                if "transformer" in config:
+                    tc = config["transformer"]
+                    logger.info_rank0(f"Transformer config keys: {sorted(tc.keys())}")
+                    logger.info_rank0(
+                        f"  caption_proj_before_connector: {tc.get('caption_proj_before_connector', 'NOT_SET')}"
+                    )
+                    logger.info_rank0(f"  cross_attention_adaln: {tc.get('cross_attention_adaln', 'NOT_SET')}")
+                    logger.info_rank0(
+                        f"  connector_num_attention_heads: {tc.get('connector_num_attention_heads', 'NOT_SET')}"
+                    )
+                    logger.info_rank0(
+                        f"  connector_attention_head_dim: {tc.get('connector_attention_head_dim', 'NOT_SET')}"
+                    )
+                    logger.info_rank0(f"  num_attention_heads: {tc.get('num_attention_heads', 'NOT_SET')}")
+                    logger.info_rank0(f"  attention_head_dim: {tc.get('attention_head_dim', 'NOT_SET')}")
                 return config
 
     config_candidates = [
         ckpt_path / "transformer" / "config.json",
         ckpt_path / "config.json",
-        ckpt_path / "model_index.json",
     ]
     if ckpt_path.is_file():
         config_candidates = [ckpt_path.parent / "transformer" / "config.json", ckpt_path.parent / "config.json"]
@@ -170,7 +184,16 @@ def _load_transformer_config(checkpoint_path: str) -> dict:
     for candidate in config_candidates:
         if candidate.exists():
             with open(candidate) as f:
-                return json.load(f)
+                config = json.load(f)
+                logger.info_rank0(f"Loaded config from file: {candidate}")
+                logger.info_rank0(f"Config keys: {sorted(config.keys())}")
+                if "transformer" in config:
+                    logger.info_rank0(
+                        f"Config has 'transformer' sub-key with keys: {sorted(config['transformer'].keys())}"
+                    )
+                else:
+                    logger.info_rank0("Config is flat (no 'transformer' sub-key)")
+                return config
 
     raise FileNotFoundError(f"No config found near {checkpoint_path}")
 
