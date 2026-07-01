@@ -13,13 +13,6 @@ class LTXRopeType(Enum):
     SPLIT = "split"
 
 
-def _rope_type_value(rope_type) -> str:
-    """Extract string value from LTXRopeType, tolerant of duplicate enum classes."""
-    if hasattr(rope_type, "value"):
-        return rope_type.value
-    return str(rope_type)
-
-
 def apply_rotary_emb(
     input_tensor: torch.Tensor,
     freqs_cis: Tuple[torch.Tensor, torch.Tensor],
@@ -32,12 +25,9 @@ def apply_rotary_emb(
     if _is_first:
         apply_rotary_emb._printed = True
 
-    rv = _rope_type_value(rope_type)
-
     if _is_first:
         cos_freqs, sin_freqs = freqs_cis
         with torch.no_grad():
-            print(f"[LTX-2 ROPE] rope_type={rv}")
             print(
                 f"[LTX-2 ROPE] input: shape={list(input_tensor.shape)}, mean={input_tensor.float().mean().item():.8f}, std={input_tensor.float().std().item():.8f}"
             )
@@ -48,9 +38,10 @@ def apply_rotary_emb(
                 f"[LTX-2 ROPE] sin_freqs: shape={list(sin_freqs.shape)}, mean={sin_freqs.float().mean().item():.8f}, std={sin_freqs.float().std().item():.8f}"
             )
 
-    if rv == LTXRopeType.INTERLEAVED.value:
+    if rope_type == LTXRopeType.INTERLEAVED:
+        # Note: INTERLEAVED rope is a legacy mode. Prefer SPLIT instead.
         output = apply_interleaved_rotary_emb(input_tensor, *freqs_cis)
-    elif rv == LTXRopeType.SPLIT.value:
+    elif rope_type == LTXRopeType.SPLIT:
         output = apply_split_rotary_emb(input_tensor, *freqs_cis)
     else:
         raise ValueError(f"Invalid rope type: {rope_type}")
@@ -247,8 +238,7 @@ def precompute_freqs_cis(
     indices = freq_grid_generator(theta, indices_grid.shape[1], dim)
     freqs = generate_freqs(indices, indices_grid, max_pos, use_middle_indices_grid)
 
-    rv = _rope_type_value(rope_type)
-    if rv == LTXRopeType.SPLIT.value:
+    if rope_type == LTXRopeType.SPLIT:
         expected_freqs = dim // 2
         current_freqs = freqs.shape[-1]
         pad_size = expected_freqs - current_freqs
