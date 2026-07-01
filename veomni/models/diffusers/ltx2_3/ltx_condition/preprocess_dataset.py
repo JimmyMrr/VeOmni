@@ -54,24 +54,32 @@ import math
 import os
 import sys
 from collections.abc import Callable
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+import av
 import numpy as np
 import torch
+from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
 from torch.utils.data import DataLoader, Dataset, Subset
+from torchvision import transforms
+from torchvision.transforms.functional import to_tensor
 from tqdm import tqdm
 
 import veomni.models.diffusers.ltx2_3.ltx_core  # noqa: F401
 from veomni.utils.device import get_device_type
 
 
+register_heif_opener()
+
 VAE_SPATIAL_FACTOR = 32
 VAE_TEMPORAL_FACTOR = 8
 DEFAULT_TILE_SIZE = 512
 DEFAULT_TILE_OVERLAP = 128
 VIDEO_EXTENSIONS = ["mp4", "avi", "mov", "mkv", "webm"]
-IMAGE_EXTENSIONS = ["jpg", "jpeg", "png"]
+IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "heif", "heic"]
 
 
 # ---------------------------------------------------------------------------
@@ -597,83 +605,20 @@ class CaptionsDataset(Dataset):
 
 
 def load_feature_extractor(checkpoint_path: str, device: torch.device, dtype: torch.dtype = torch.bfloat16):
-    """Load feature extractor weights from LTX-2 checkpoint."""
-    from ltx_core.text_encoders.gemma.encoders.encoder_configurator import (
-        EMBEDDINGS_PROCESSOR_KEY_REMAP,
-        _create_feature_extractor,
+    """Load feature extractor using EmbeddingsProcessor (matches LTX-2 exactly)."""
+    from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
+    from ltx_core.text_encoders.gemma import (
+        EMBEDDINGS_PROCESSOR_KEY_OPS,
+        EmbeddingsProcessorConfigurator,
     )
-    from safetensors import safe_open
 
-    ckpt_path = Path(checkpoint_path)
+    embeddings_processor = SingleGPUModelBuilder(
+        model_path=str(checkpoint_path),
+        model_class_configurator=EmbeddingsProcessorConfigurator,
+        model_sd_ops=EMBEDDINGS_PROCESSOR_KEY_OPS,
+    ).build(device=device, dtype=dtype)
 
-    transformer_config_path = (
-        ckpt_path / "transformer" / "config.json"
-        if ckpt_path.is_dir()
-        else ckpt_path.parent / "transformer" / "config.json"
-    )
-    if not transformer_config_path.exists():
-        transformer_config_path = ckpt_path / "config.json" if ckpt_path.is_dir() else ckpt_path.parent / "config.json"
-
-    with open(transformer_config_path) as f:
-        config = json.load(f)
-
-    transformer_config = config.get("transformer", config)
-    feature_extractor = _create_feature_extractor(transformer_config)
-
-    fe_prefixes = {
-        old_prefix: new_prefix
-        for old_prefix, new_prefix in EMBEDDINGS_PROCESSOR_KEY_REMAP.items()
-        if new_prefix.startswith("feature_extractor.")
-    }
-    target_prefixes = tuple(fe_prefixes.keys())
-
-    fe_state_dict = {}
-
-    if ckpt_path.is_dir():
-        safetensor_files = sorted(ckpt_path.glob("*.safetensors"))
-    elif ckpt_path.suffix == ".safetensors":
-        safetensor_files = [ckpt_path]
-    else:
-        safetensor_files = []
-
-    if safetensor_files:
-        for sf_path in safetensor_files:
-            with safe_open(str(sf_path), framework="pt", device=str(device)) as f:
-                for key in f.keys():
-                    if key.startswith(target_prefixes):
-                        for old_prefix in fe_prefixes:
-                            if key.startswith(old_prefix):
-                                fe_key = "feature_extractor." + key[len(old_prefix) :]
-                                fe_state_dict[fe_key] = f.get_tensor(key).to(dtype)
-                                break
-    else:
-        if ckpt_path.is_dir():
-            bin_files = sorted(ckpt_path.glob("*.bin")) + sorted(ckpt_path.glob("*.pt"))
-        elif ckpt_path.suffix in (".bin", ".pt"):
-            bin_files = [ckpt_path]
-        else:
-            bin_files = []
-
-        for bin_path in bin_files:
-            all_state_dict = torch.load(str(bin_path), map_location=device, weights_only=True)
-            for key, value in all_state_dict.items():
-                for old_prefix in fe_prefixes:
-                    if key.startswith(old_prefix):
-                        fe_key = "feature_extractor." + key[len(old_prefix) :]
-                        fe_state_dict[fe_key] = value.to(dtype)
-                        break
-            del all_state_dict
-
-    if fe_state_dict:
-        missing, unexpected = feature_extractor.load_state_dict(fe_state_dict, strict=False)
-        if missing:
-            print(f"Feature extractor missing keys: {missing}")
-        if unexpected:
-            print(f"Feature extractor unexpected keys: {unexpected}")
-    else:
-        print("WARNING: No feature extractor weights found in checkpoint!")
-
-    return feature_extractor.to(device=device, dtype=dtype)
+    return embeddings_processor.feature_extractor
 
 
 def compute_caption_embeddings(
@@ -744,10 +689,10 @@ def compute_caption_embeddings(
     print(f"Processing captions in {len(dataloader):,} batches...")
 
     for batch in tqdm(dataloader, desc="Encoding captions"):
-        with torch.no_grad():
+        with torch.inference_mode():
             for i in range(len(batch["prompt"])):
                 hidden_states, prompt_attention_mask = text_encoder.encode(batch["prompt"][i], padding_side="left")
-                video_feats, audio_feats = feature_extractor(hidden_states, prompt_attention_mask, padding_side="left")
+                video_feats, audio_feats = feature_extractor(hidden_states, prompt_attention_mask, "left")
 
                 output_rel_path = Path(batch["output_path"][i])
                 out_dir = output_path / output_rel_path.parent
@@ -813,58 +758,70 @@ def compute_scaled_resolution_buckets(
 
 
 def _read_video_frames(video_path: Path, max_frames: int) -> tuple[torch.Tensor, float]:
-    """Read video frames as ``[F, C, H, W]`` float tensor in ``[0, 1]``."""
-    try:
-        from torchvision.io import read_video as tv_read_video
+    """Read video frames as ``[F, C, H, W]`` float tensor in ``[0, 1]`` using PyAV."""
+    with av.open(str(video_path)) as container:
+        video_stream = container.streams.video[0]
+        fps = float(video_stream.average_rate or video_stream.base_rate or 24)
 
-        video, _audio, info = tv_read_video(str(video_path), pts_unit="sec")
-        fps = info.get("video_fps", 24.0)
-        video = video.float() / 255.0
-        video = video.permute(0, 3, 1, 2)
-        video = video[:max_frames]
-        return video, fps
-    except Exception:
-        pass
+        frames = []
+        for frame in container.decode(video=0):
+            if max_frames is not None and len(frames) >= max_frames:
+                break
+            frames.append(frame.to_ndarray(format="rgb24"))
 
-    try:
-        import imageio.v3 as iio
-
-        frames = iio.imread(str(video_path), plugin="pyav")
-        fps = 24.0
-        try:
-            props = iio.props(str(video_path), plugin="pyav")
-            fps = props.get("fps", 24.0)
-        except Exception:
-            pass
-        frames_tensor = torch.from_numpy(frames).float() / 255.0
-        if frames_tensor.dim() == 3:
-            frames_tensor = frames_tensor.unsqueeze(0)
-        frames_tensor = frames_tensor.permute(0, 3, 1, 2)
-        frames_tensor = frames_tensor[:max_frames]
-        return frames_tensor, fps
-    except ImportError:
-        pass
-
-    raise RuntimeError(f"Cannot read video {video_path}. Install torchvision or imageio[pyav].")
+    frames_np = np.stack(frames, axis=0)
+    video = torch.from_numpy(frames_np).float().div(255.0)
+    return video.permute(0, 3, 1, 2), fps
 
 
 def _get_video_frame_count(video_path: Path) -> int:
-    """Get frame count without loading all frames."""
-    try:
-        from torchvision.io import read_video as tv_read_video
+    """Get frame count using PyAV (matches LTX-2 exactly)."""
+    with av.open(str(video_path)) as container:
+        video_stream = container.streams.video[0]
 
-        _v, _a, info = tv_read_video(str(video_path), pts_unit="sec")
-        return info.get("video_frames", 0)
-    except Exception:
-        pass
-    try:
-        import imageio.v3 as iio
+        if video_stream.frames > 0:
+            return video_stream.frames
 
-        props = iio.props(str(video_path), plugin="pyav")
-        return props.get("n_frames", 0)
-    except Exception:
-        pass
-    return 0
+        rate = video_stream.average_rate or video_stream.base_rate
+        if video_stream.duration and video_stream.time_base and rate:
+            duration = Fraction(video_stream.duration) * Fraction(video_stream.time_base)
+            return round(duration * Fraction(rate))
+
+        return sum(1 for _ in container.decode(video=0))
+
+
+def _open_image_as_srgb(image_path):
+    """Open image with EXIF rotation and ICC profile conversion (matches LTX-2)."""
+    import io
+
+    from PIL import ExifTags, ImageCms
+
+    exif_colorspace_srgb = 1
+
+    with Image.open(image_path) as img_raw:
+        img = ImageOps.exif_transpose(img_raw)
+
+    input_icc_profile = img.info.get("icc_profile")
+
+    srgb_profile = ImageCms.createProfile(colorSpace="sRGB")
+    if input_icc_profile is not None:
+        input_profile = ImageCms.ImageCmsProfile(io.BytesIO(input_icc_profile))
+        srgb_img = ImageCms.profileToProfile(img, input_profile, srgb_profile, outputMode="RGB")
+    else:
+        exif_data = img.getexif()
+        if exif_data is not None:
+            color_space_value = exif_data.get(ExifTags.Base.ColorSpace.value)
+            if color_space_value is not None and color_space_value != exif_colorspace_srgb:
+                raise ValueError(
+                    f"Image has colorspace tag in EXIF but it isn't set to sRGB, "
+                    f"conversion is not supported. EXIF ColorSpace tag value is {color_space_value}"
+                )
+
+        srgb_img = img.convert("RGB")
+        srgb_profile_data = ImageCms.ImageCmsProfile(srgb_profile).tobytes()
+        srgb_img.info["icc_profile"] = srgb_profile_data
+
+    return srgb_img
 
 
 def _resize_and_crop(
@@ -924,9 +881,9 @@ def _select_bucket(
 
 
 class MediaDataset(Dataset):
-    """Dataset for processing video files with resolution bucket selection.
+    """Dataset for processing video and image files with resolution bucket selection.
 
-    Loads videos from CSV/JSON/JSONL metadata, applies resize/crop transforms,
+    Loads videos/images from CSV/JSON/JSONL metadata, applies resize/crop transforms,
     handles resolution bucket matching, and optionally extracts audio.
     """
 
@@ -952,6 +909,13 @@ class MediaDataset(Dataset):
 
         self.max_target_frames = max(self.resolution_buckets, key=lambda x: x[0])[0]
 
+        self.transforms = transforms.Compose(
+            [
+                transforms.Lambda(lambda x: x.clamp_(0, 1)),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
+            ]
+        )
+
     def __len__(self) -> int:
         return len(self.video_paths)
 
@@ -964,37 +928,126 @@ class MediaDataset(Dataset):
         relative_path = str(video_path.relative_to(data_root))
         media_relative_path = str(self.main_media_paths[index].relative_to(data_root))
 
-        video_frames, fps = _read_video_frames(video_path, self.max_target_frames)
-        num_frames, _c, h, w = video_frames.shape
+        if video_path.suffix.lower() in [".png", ".jpg", ".jpeg", ".heif", ".heic"]:
+            media_tensor = self._preprocess_image(video_path)
+            fps = 1.0
+            audio_data = None
+        else:
+            media_tensor, fps = self._preprocess_video(video_path)
 
-        target_f, target_h, target_w = _select_bucket(num_frames, h, w, self.resolution_buckets)
-        video_frames = _resize_and_crop(video_frames[:target_f], target_h, target_w, self.reshape_mode)
+            if self.with_audio:
+                target_duration = media_tensor.shape[1] / fps
+                audio_data = self._extract_audio(video_path, target_duration)
+            else:
+                audio_data = None
 
-        video_frames = video_frames.clamp(0, 1)
-        video_frames = (video_frames - 0.5) / 0.5
-
-        video_cfhw = video_frames.permute(1, 0, 2, 3).contiguous()
-        _, num_frames_out, height_out, width_out = video_cfhw.shape
+        _, num_frames, height, width = media_tensor.shape
 
         result: dict[str, Any] = {
-            "video": video_cfhw,
+            "video": media_tensor,
             "relative_path": relative_path,
             "main_media_relative_path": media_relative_path,
             "video_metadata": {
-                "num_frames": num_frames_out,
-                "height": height_out,
-                "width": width_out,
+                "num_frames": num_frames,
+                "height": height,
+                "width": width,
                 "fps": fps,
             },
         }
 
-        if self.with_audio:
-            target_duration = num_frames_out / fps
-            audio_data = self._extract_audio(video_path, target_duration)
-            if audio_data is not None:
-                result["audio"] = audio_data
+        if audio_data is not None:
+            result["audio"] = audio_data
 
         return result
+
+    def _preprocess_image(self, path: Path) -> torch.Tensor:
+        """Preprocess a single image (matches LTX-2 exactly)."""
+        image = _open_image_as_srgb(path)
+        image = to_tensor(image)
+        image = image.unsqueeze(0)
+
+        nearest_bucket = self._get_resolution_bucket(image)
+        _, target_height, target_width = nearest_bucket
+        image_resized = self._resize_and_crop(image, target_height, target_width)
+
+        image = self.transforms(image_resized)
+        image = image.unsqueeze(1)
+        return image
+
+    def _preprocess_video(self, path: Path) -> tuple[torch.Tensor, float]:
+        """Preprocess a video (matches LTX-2 exactly)."""
+        video, fps = _read_video_frames(path, self.max_target_frames)
+
+        nearest_bucket = self._get_resolution_bucket(video)
+        target_num_frames, target_height, target_width = nearest_bucket
+        frames_resized = self._resize_and_crop(video, target_height, target_width)
+
+        frames_resized = frames_resized[:target_num_frames]
+
+        video = torch.stack([self.transforms(frame) for frame in frames_resized], dim=0)
+        video = video.permute(1, 0, 2, 3).contiguous()
+
+        return video, fps
+
+    def _resize_and_crop(self, media_tensor: torch.Tensor, target_height: int, target_width: int) -> torch.Tensor:
+        """Resize and crop tensor to target size (matches LTX-2 exactly)."""
+        from torchvision.transforms import InterpolationMode
+        from torchvision.transforms.functional import crop, resize
+
+        current_height, current_width = media_tensor.shape[2], media_tensor.shape[3]
+
+        current_aspect = current_width / current_height
+        target_aspect = target_width / target_height
+
+        if current_aspect > target_aspect:
+            new_width = int(current_width * target_height / current_height)
+            media_tensor = resize(
+                media_tensor,
+                size=[target_height, new_width],
+                interpolation=InterpolationMode.BICUBIC,
+            )
+        else:
+            new_height = int(current_height * target_width / current_width)
+            media_tensor = resize(
+                media_tensor,
+                size=[new_height, target_width],
+                interpolation=InterpolationMode.BICUBIC,
+            )
+
+        current_height, current_width = media_tensor.shape[2], media_tensor.shape[3]
+        media_tensor = media_tensor.squeeze(0)
+
+        delta_h = current_height - target_height
+        delta_w = current_width - target_width
+
+        if self.reshape_mode == "random":
+            top = np.random.randint(0, delta_h + 1)
+            left = np.random.randint(0, delta_w + 1)
+        elif self.reshape_mode == "center":
+            top, left = delta_h // 2, delta_w // 2
+        else:
+            raise ValueError(f"Unsupported reshape mode: {self.reshape_mode}")
+
+        media_tensor = crop(media_tensor, top=top, left=left, height=target_height, width=target_width)
+        return media_tensor
+
+    def _get_resolution_bucket(self, media_tensor: torch.Tensor) -> tuple[int, int, int]:
+        """Get the nearest resolution bucket for the given media tensor."""
+        num_frames, _, height, width = media_tensor.shape
+
+        def distance(bucket: tuple[int, int, int]) -> tuple:
+            bf, bh, bw = bucket
+            return (
+                abs(math.log(width / height) - math.log(bw / bh)),
+                -bf,
+                -(bh * bw),
+            )
+
+        relevant = [b for b in self.resolution_buckets if b[0] <= num_frames]
+        if not relevant:
+            raise ValueError(f"No bucket has <= {num_frames} frames. Buckets: {self.resolution_buckets}")
+
+        return min(relevant, key=distance)
 
     @staticmethod
     def _extract_audio(video_path: Path, target_duration: float) -> dict[str, Any] | None:
@@ -1024,9 +1077,15 @@ class MediaDataset(Dataset):
         for i, video_path in enumerate(self.video_paths):
             if not video_path.is_file():
                 continue
+
+            if video_path.suffix.lower() in [".png", ".jpg", ".jpeg", ".heif", ".heic"]:
+                valid_video_paths.append(video_path)
+                valid_main_media_paths.append(self.main_media_paths[i])
+                continue
+
             try:
                 frame_count = _get_video_frame_count(video_path)
-                if frame_count >= min_frames_required or frame_count == 0:
+                if frame_count >= min_frames_required:
                     valid_video_paths.append(video_path)
                     valid_main_media_paths.append(self.main_media_paths[i])
                 else:
@@ -1339,7 +1398,7 @@ def compute_video_latents(
     for batch in tqdm(dataloader, desc="Encoding videos"):
         video = batch["video"]
 
-        with torch.no_grad():
+        with torch.inference_mode():
             video_latent_data = encode_video(vae=vae, video=video, use_tiling=vae_tiling)
 
         for i in range(len(batch["relative_path"])):

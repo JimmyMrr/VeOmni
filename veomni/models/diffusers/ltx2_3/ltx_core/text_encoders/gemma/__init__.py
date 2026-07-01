@@ -9,14 +9,18 @@ from ltx_core.text_encoders.gemma.encoders.base_encoder import (
     GemmaTextEncoder,
 )
 from ltx_core.text_encoders.gemma.encoders.encoder_configurator import (
+    EMBEDDINGS_PROCESSOR_KEY_OPS,
     EMBEDDINGS_PROCESSOR_KEY_REMAP,
+    EmbeddingsProcessorConfigurator,
     build_embeddings_processor,
 )
 
 
 __all__ = [
+    "EMBEDDINGS_PROCESSOR_KEY_OPS",
     "EMBEDDINGS_PROCESSOR_KEY_REMAP",
     "EmbeddingsProcessor",
+    "EmbeddingsProcessorConfigurator",
     "EmbeddingsProcessorOutput",
     "GemmaTextEncoder",
     "build_embeddings_processor",

@@ -1,4 +1,6 @@
 import torch
+from ltx_core.loader.sd_ops import SDOps
+from ltx_core.model.model_protocol import ModelConfigurator
 from ltx_core.text_encoders.gemma.config import GEMMA3_CONFIG_FOR_LTX
 from ltx_core.text_encoders.gemma.embeddings_connector import (
     AudioEmbeddings1DConnectorConfigurator,
@@ -9,6 +11,22 @@ from ltx_core.text_encoders.gemma.feature_extractor import (
     FeatureExtractorV1,
     FeatureExtractorV2,
 )
+
+
+class EmbeddingsProcessorConfigurator(ModelConfigurator[EmbeddingsProcessor]):
+    @classmethod
+    def from_config(cls, config: dict) -> EmbeddingsProcessor:
+        transformer_config = config.get("transformer", {})
+
+        video_connector = Embeddings1DConnectorConfigurator.from_config(config)
+        audio_connector = AudioEmbeddings1DConnectorConfigurator.from_config(config)
+        feature_extractor = _create_feature_extractor(transformer_config)
+
+        return EmbeddingsProcessor(
+            video_connector=video_connector,
+            audio_connector=audio_connector,
+            feature_extractor=feature_extractor,
+        )
 
 
 _V2_EXPECTED_CONFIG = {
@@ -80,3 +98,17 @@ EMBEDDINGS_PROCESSOR_KEY_REMAP = {
     "model.diffusion_model.video_embeddings_connector.": "video_connector.",
     "model.diffusion_model.audio_embeddings_connector.": "audio_connector.",
 }
+
+EMBEDDINGS_PROCESSOR_KEY_OPS = (
+    SDOps("EMBEDDINGS_PROCESSOR_KEY_OPS")
+    .with_matching(prefix="text_embedding_projection.aggregate_embed.")
+    .with_replacement("text_embedding_projection.aggregate_embed.", "feature_extractor.aggregate_embed.")
+    .with_matching(prefix="text_embedding_projection.video_aggregate_embed.")
+    .with_replacement("text_embedding_projection.video_aggregate_embed.", "feature_extractor.video_aggregate_embed.")
+    .with_matching(prefix="text_embedding_projection.audio_aggregate_embed.")
+    .with_replacement("text_embedding_projection.audio_aggregate_embed.", "feature_extractor.audio_aggregate_embed.")
+    .with_matching(prefix="model.diffusion_model.video_embeddings_connector.")
+    .with_replacement("model.diffusion_model.video_embeddings_connector.", "video_connector.")
+    .with_matching(prefix="model.diffusion_model.audio_embeddings_connector.")
+    .with_replacement("model.diffusion_model.audio_embeddings_connector.", "audio_connector.")
+)
