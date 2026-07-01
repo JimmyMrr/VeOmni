@@ -642,7 +642,6 @@ def compute_caption_embeddings(
     ``accelerate.PartialState``. Already-computed outputs are skipped unless
     *overwrite* is True; writes are atomic so interrupted runs are safe to resume.
     """
-    from ltx_core.text_encoders.gemma.encoders.base_encoder import GemmaTextEncoder
 
     device_str = device or get_device_type()
     dev = torch.device(device_str)
@@ -675,11 +674,24 @@ def compute_caption_embeddings(
         return
 
     print("Loading Gemma text encoder...")
-    text_encoder = GemmaTextEncoder.from_pretrained(gemma_model_path, max_length=max_sequence_length)
-    if load_in_8bit:
-        text_encoder = text_encoder.to(device=dev)
-    else:
-        text_encoder = text_encoder.to(device=dev, dtype=dtype)
+    from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
+    from ltx_core.text_encoders.gemma import (
+        GEMMA_LLM_KEY_OPS,
+        GEMMA_MODEL_OPS,
+        GemmaTextEncoderConfigurator,
+        module_ops_from_gemma_root,
+    )
+    from ltx_core.utils import find_matching_file
+
+    gemma_model_folder = find_matching_file(str(gemma_model_path), "model*.safetensors").parent
+    gemma_weight_paths = [str(p) for p in gemma_model_folder.rglob("*.safetensors")]
+
+    text_encoder = SingleGPUModelBuilder(
+        model_path=tuple(gemma_weight_paths),
+        model_class_configurator=GemmaTextEncoderConfigurator,
+        model_sd_ops=GEMMA_LLM_KEY_OPS,
+        module_ops=(GEMMA_MODEL_OPS, *module_ops_from_gemma_root(str(gemma_model_path))),
+    ).build(device=dev, dtype=dtype)
     text_encoder.eval()
 
     print("Loading feature extractor from checkpoint...")
