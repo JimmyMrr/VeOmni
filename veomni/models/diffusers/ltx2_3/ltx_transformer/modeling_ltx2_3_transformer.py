@@ -56,17 +56,56 @@ def LTXSPAttention_forward(
     perturbation_mask: torch.Tensor | None = None,
     all_perturbed: bool = False,
 ) -> torch.Tensor:
+    _dbg = os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1"
     is_cross_attention = context is not None
+
+    if x.dtype != torch.bfloat16:
+        x = x.to(torch.bfloat16)
+    if context is not None and context.dtype != torch.bfloat16:
+        context = context.to(torch.bfloat16)
+
     context = x if context is None else context
     use_attention = not all_perturbed
+
+    if _dbg and not hasattr(Attention, "_veomni_attn_counter"):
+        Attention._veomni_attn_counter = 0
+    _attn_idx = getattr(Attention, "_veomni_attn_counter", -1)
+    if _dbg:
+        Attention._veomni_attn_counter = _attn_idx + 1
+    _is_first = _dbg and _attn_idx == 0
+
     v = self.to_v(context)
+
+    if _is_first:
+        with torch.no_grad():
+            print(
+                f"[VeOmni ATTN-0] v: shape={list(v.shape)}, dtype={v.dtype}, "
+                f"mean={v.float().mean().item():.8f}, std={v.float().std().item():.8f}"
+            )
 
     if not use_attention:
         out = v
     else:
         q = self.to_q(x)
         k = self.to_k(context)
+
+        if _is_first:
+            with torch.no_grad():
+                print(
+                    f"[VeOmni ATTN-0] after linear proj: "
+                    f"q.dtype={q.dtype}, q.mean={q.float().mean().item():.8f}, "
+                    f"k.dtype={k.dtype}, k.mean={k.float().mean().item():.8f}"
+                )
+
         q, k = self.preattention_function(q, k, self, mask, pe, k_pe)
+
+        if _is_first:
+            with torch.no_grad():
+                print(
+                    f"[VeOmni ATTN-0] after preattention (RoPE): "
+                    f"q.dtype={q.dtype}, q.mean={q.float().mean().item():.8f}, "
+                    f"k.dtype={k.dtype}, k.mean={k.float().mean().item():.8f}"
+                )
 
         sp_enabled = get_parallel_state().sp_enabled and not is_cross_attention
 
@@ -98,6 +137,16 @@ def LTXSPAttention_forward(
         else:
             out = self.masked_attention_function(q, k, v_sp, sp_heads, mask)
 
+        if _is_first:
+            with torch.no_grad():
+                print(
+                    f"[VeOmni ATTN-0] after attention: "
+                    f"shape={list(out.shape)}, dtype={out.dtype}, "
+                    f"mean={out.float().mean().item():.8f}, "
+                    f"std={out.float().std().item():.8f}, "
+                    f"attn_fn={type(self.attention_function).__name__}"
+                )
+
         if sp_enabled:
             out = out.unflatten(-1, (sp_heads, self.dim_head))
             out = gather_heads_scatter_seq(out, seq_dim=1, head_dim=2, group=ulysses_group)
@@ -109,7 +158,18 @@ def LTXSPAttention_forward(
     if self.to_gate_logits is not None:
         out = self.gated_attention_function(x, out, self)
 
-    return self.to_out(out)
+    out = self.to_out(out)
+
+    if _is_first:
+        with torch.no_grad():
+            print(
+                f"[VeOmni ATTN-0] after to_out: "
+                f"shape={list(out.shape)}, dtype={out.dtype}, "
+                f"mean={out.float().mean().item():.8f}, "
+                f"std={out.float().std().item():.8f}"
+            )
+
+    return out
 
 
 def LTXVideoModel_forward(
@@ -119,6 +179,9 @@ def LTXVideoModel_forward(
     perturbations: BatchedPerturbationConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _dbg = os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1"
+
+    if _dbg:
+        Attention._veomni_attn_counter = 0
 
     if _dbg:
         _param_dtype = next(self.parameters()).dtype
