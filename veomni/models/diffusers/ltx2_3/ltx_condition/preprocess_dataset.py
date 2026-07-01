@@ -472,24 +472,39 @@ def _caption_with_ltx_trainer(
 # ---------------------------------------------------------------------------
 
 
+COMMON_BEGINNING_PHRASES: tuple[str, ...] = (
+    "This video",
+    "The video",
+    "This clip",
+    "The clip",
+    "The animation",
+    "This image",
+    "The image",
+    "This picture",
+    "The picture",
+)
+
+COMMON_CONTINUATION_WORDS: tuple[str, ...] = (
+    "shows",
+    "depicts",
+    "features",
+    "captures",
+    "highlights",
+    "introduces",
+    "presents",
+)
+
 COMMON_LLM_START_PHRASES: tuple[str, ...] = (
     "In the video,",
     "In this video,",
     "In this video clip,",
     "In the clip,",
     "Caption:",
-    "This video shows",
-    "The video shows",
-    "This clip shows",
-    "The clip shows",
-    "This video depicts",
-    "The video depicts",
-    "This video captures",
-    "The video captures",
-    "This video features",
-    "The video features",
-    "This image shows",
-    "The image shows",
+    *(
+        f"{beginning} {continuation}"
+        for beginning in COMMON_BEGINNING_PHRASES
+        for continuation in COMMON_CONTINUATION_WORDS
+    ),
 )
 
 
@@ -940,7 +955,7 @@ class MediaDataset(Dataset):
         relative_path = str(video_path.relative_to(data_root))
         media_relative_path = str(self.main_media_paths[index].relative_to(data_root))
 
-        if video_path.suffix.lower() in [".png", ".jpg", ".jpeg", ".heif", ".heic"]:
+        if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
             media_tensor = self._preprocess_image(video_path)
             fps = 1.0
             audio_data = None
@@ -1090,7 +1105,7 @@ class MediaDataset(Dataset):
             if not video_path.is_file():
                 continue
 
-            if video_path.suffix.lower() in [".png", ".jpg", ".jpeg", ".heif", ".heic"]:
+            if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
                 valid_video_paths.append(video_path)
                 valid_main_media_paths.append(self.main_media_paths[i])
                 continue
@@ -1103,8 +1118,7 @@ class MediaDataset(Dataset):
                 else:
                     print(f"  Skipping {video_path} — {frame_count} frames < {min_frames_required}")
             except Exception:
-                valid_video_paths.append(video_path)
-                valid_main_media_paths.append(self.main_media_paths[i])
+                pass
 
         self.video_paths = valid_video_paths
         self.main_media_paths = valid_main_media_paths
