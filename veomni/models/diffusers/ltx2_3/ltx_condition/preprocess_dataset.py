@@ -1717,7 +1717,7 @@ def main():
     sp_parquet.add_argument("--output_dir", type=str, required=True, help="Output directory for parquet shards")
     sp_parquet.add_argument("--shard_size", type=int, default=1000, help="Number of samples per parquet shard")
     sp_parquet.add_argument(
-        "--pad-to-multiple-of",
+        "--pad_to_multiple_of",
         type=int,
         default=None,
         help="Pad total samples to be divisible by this number (e.g., dp_size for distributed training)",
