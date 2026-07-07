@@ -36,6 +36,32 @@ def _check_uninitialized(model: nn.Module) -> list[str]:
     return names
 
 
+def _materialize_meta_params(model: nn.Module, device: torch.device) -> None:
+    """Replace meta-device parameters/buffers with zero-initialized tensors on *device*."""
+    for name, param in list(model.named_parameters()):
+        if str(param.device) == "meta":
+            parts = name.rsplit(".", 1)
+            if len(parts) == 2:
+                parent, attr = parts
+                module = dict(model.named_modules())[parent]
+            else:
+                module, attr = model, parts[0]
+            new_param = nn.Parameter(
+                torch.zeros(param.shape, dtype=param.dtype, device=device), requires_grad=param.requires_grad
+            )
+            setattr(module, attr, new_param)
+    for name, buf in list(model.named_buffers()):
+        if str(buf.device) == "meta":
+            parts = name.rsplit(".", 1)
+            if len(parts) == 2:
+                parent, attr = parts
+                module = dict(model.named_modules())[parent]
+            else:
+                module, attr = model, parts[0]
+            new_buf = torch.zeros(buf.shape, dtype=buf.dtype, device=device)
+            module.register_buffer(attr, new_buf)
+
+
 def _load_model_weights(
     meta_model: nn.Module,
     model_path: str | tuple[str, ...],
@@ -146,7 +172,8 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         uninitialized = _check_uninitialized(meta_model)
         if uninitialized:
             logger.warning(f"Uninitialized parameters or buffers: {uninitialized}")
-            return meta_model
+            _materialize_meta_params(meta_model, device)
+            return meta_model.to(device)
         return meta_model.to(device)
 
     def build(
@@ -155,7 +182,10 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         dtype: torch.dtype | None = None,
         **kwargs: object,  # noqa: ARG002
     ) -> ModelType:
-        device = torch.device("cuda") if device is None else device
+        if device is None:
+            from veomni.utils.device import get_device_type
+
+            device = torch.device(get_device_type())
         config = self.model_config()
         meta_model = self.meta_model(config, self.module_ops)
 

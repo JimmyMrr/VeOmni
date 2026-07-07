@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TypeVar
 
 import torch
@@ -16,6 +17,16 @@ from torch import nn
 _M = TypeVar("_M", bound=nn.Module)
 
 
+def _resolve_safetensors_path(path: str) -> str:
+    """If *path* is a directory, return the first .safetensors file inside it."""
+    p = Path(path)
+    if p.is_dir():
+        matches = sorted(p.rglob("*.safetensors"))
+        if matches:
+            return str(matches[0])
+    return path
+
+
 def load_state_dict(
     paths: str | tuple[str, ...] | list[str],
     loader: StateDictLoader,
@@ -25,11 +36,11 @@ def load_state_dict(
 ) -> StateDict:
     """Load a state dict from disk, using registry caching."""
     if isinstance(paths, str):
-        path_list = [paths]
+        path_list = [_resolve_safetensors_path(paths)]
     elif isinstance(paths, tuple):
-        path_list = list(paths)
+        path_list = [_resolve_safetensors_path(p) for p in paths]
     else:
-        path_list = paths
+        path_list = [_resolve_safetensors_path(p) for p in paths]
     cached = registry.get(path_list, sd_ops)
     if cached is not None:
         return cached
@@ -44,6 +55,7 @@ def read_model_config(
 ) -> dict:
     """Read metadata from the first shard of a checkpoint."""
     first = model_path[0] if isinstance(model_path, tuple) else model_path
+    first = _resolve_safetensors_path(first)
     return loader.metadata(first)
 
 

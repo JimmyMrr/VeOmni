@@ -439,7 +439,7 @@ def _caption_with_ltx_trainer(
 ) -> None:
     from veomni.models.diffusers.ltx2_3.ltx_condition.captioning import CaptionerType, create_captioner
 
-    device_str = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device_str = device or get_device_type()
     ct = CaptionerType(captioner_type)
     captioner = create_captioner(captioner_type=ct, device=device_str, instruction=instruction)
 
@@ -621,9 +621,11 @@ def load_feature_extractor(checkpoint_path: str, device: torch.device, dtype: to
         EMBEDDINGS_PROCESSOR_KEY_OPS,
         EmbeddingsProcessorConfigurator,
     )
+    from ltx_core.utils import find_matching_file
 
+    checkpoint_file = find_matching_file(str(checkpoint_path), "*.safetensors")
     embeddings_processor = SingleGPUModelBuilder(
-        model_path=str(checkpoint_path),
+        model_path=str(checkpoint_file),
         model_class_configurator=EmbeddingsProcessorConfigurator,
         model_sd_ops=EMBEDDINGS_PROCESSOR_KEY_OPS,
     ).build(device=device, dtype=dtype)

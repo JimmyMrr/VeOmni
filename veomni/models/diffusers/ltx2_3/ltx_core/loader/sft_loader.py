@@ -55,7 +55,7 @@ class SafetensorsModelStateDictLoader(StateDictLoader):
         self.weight_loader = weight_loader if weight_loader is not None else SafetensorsStateDictLoader()
 
     def metadata(self, path: str) -> dict:
-        with safetensors.safe_open(path, framework="pt") as f:
+        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
             meta = f.metadata()
             if meta is None or "config" not in meta:
                 return {}

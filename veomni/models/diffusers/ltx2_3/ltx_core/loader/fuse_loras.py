@@ -71,8 +71,11 @@ bf16_fuse_rule = FuseRule(aggregation_dtype=torch.bfloat16, fuse_fn=_bf16_fuse)
 
 
 def _get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda", torch.cuda.current_device())
+    from veomni.utils.device import get_device_id, get_device_type
+
+    device_type = get_device_type()
+    if device_type != "cpu":
+        return torch.device(device_type, get_device_id())
     return torch.device("cpu")
 
 

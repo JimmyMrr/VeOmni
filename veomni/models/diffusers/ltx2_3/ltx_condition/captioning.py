@@ -105,7 +105,9 @@ class QwenOmniCaptioner(MediaCaptioningModel):
         use_8bit: bool = False,
         instruction: str | None = None,
     ):
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        from veomni.utils.device import get_device_type
+
+        self.device = torch.device(device or get_device_type())
         self.instruction = instruction
         self._load_model(use_8bit=use_8bit)
 
@@ -191,12 +193,23 @@ class QwenOmniCaptioner(MediaCaptioningModel):
 
         quantization_config = BitsAndBytesConfig(load_in_8bit=True) if use_8bit else None
 
+        is_npu = self.device.type == "npu"
+        if is_npu:
+            import torch_npu  # noqa: PLC0415, F401
+
+            torch.npu.set_device(self.device.index or 0)
+            dtype = torch.float16
+            device_map = {"": f"npu:{self.device.index or 0}"}
+        else:
+            dtype = torch.bfloat16
+            device_map = "auto"
+
         self.model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
             self.MODEL_ID,
-            dtype=torch.bfloat16,
+            dtype=dtype,
             low_cpu_mem_usage=True,
             quantization_config=quantization_config,
-            device_map="auto",
+            device_map=device_map,
         )
 
         self.processor = Qwen2_5OmniProcessor.from_pretrained(self.MODEL_ID)
