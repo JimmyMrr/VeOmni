@@ -12,26 +12,26 @@ Subcommands:
 
 Usage examples:
     # Full pipeline
-    python preprocess_dataset.py all \\
-        --video_dir /path/to/raw/videos \\
-        --data_dir /path/to/output \\
-        --gemma_model_path /path/to/gemma3 \\
-        --checkpoint_path /path/to/ltx2.safetensors \\
+    python preprocess_dataset.py all \
+        --video_dir /path/to/raw/videos \
+        --data_dir /path/to/output \
+        --gemma_model_path /path/to/gemma3 \
+        --checkpoint_path /path/to/ltx2.safetensors \
         --resolution_buckets 768x768x49
 
     # Only preprocess (text embeddings + VAE latents)
-    python preprocess_dataset.py preprocess \\
-        --dataset_file /path/to/dataset.json \\
-        --gemma_model_path /path/to/gemma3 \\
-        --checkpoint_path /path/to/ltx2.safetensors \\
+    python preprocess_dataset.py preprocess \
+        --dataset_file /path/to/dataset.json \
+        --gemma_model_path /path/to/gemma3 \
+        --checkpoint_path /path/to/ltx2.safetensors \
         --resolution_buckets 768x768x49
 
     # Preprocess with reference videos for IC-LoRA
-    python preprocess_dataset.py preprocess \\
-        --dataset_file /path/to/dataset.json \\
-        --gemma_model_path /path/to/gemma3 \\
-        --checkpoint_path /path/to/ltx2.safetensors \\
-        --resolution_buckets 768x768x49 \\
+    python preprocess_dataset.py preprocess \
+        --dataset_file /path/to/dataset.json \
+        --gemma_model_path /path/to/gemma3 \
+        --checkpoint_path /path/to/ltx2.safetensors \
+        --resolution_buckets 768x768x49 \
         --reference_column reference_path
 
 Output directory structure (after full pipeline):
@@ -337,7 +337,7 @@ def caption_videos(
     """Generate captions for all videos in *input_dir*.
 
     Supports two captioner backends:
-    - ``qwen_omni``: local Qwen2.5-Omni model (requires ``ltx_trainer``)
+    - ``qwen_omni``: local Qwen2.5-Omni model (bundled in ``captioning.py``)
     - ``gemini_flash``: Google Gemini API (requires ``GOOGLE_API_KEY``)
 
     Returns the path to the generated dataset file.
@@ -437,12 +437,7 @@ def _caption_with_ltx_trainer(
     fps: int,
     include_audio: bool,
 ) -> None:
-    try:
-        from ltx_trainer.captioning import CaptionerType, create_captioner
-    except ImportError:
-        print("ERROR: ltx_trainer is required for local captioning.")
-        print("  pip install ltx-trainer")
-        sys.exit(1)
+    from veomni.models.diffusers.ltx2_3.ltx_condition.captioning import CaptionerType, create_captioner
 
     device_str = device or ("cuda" if torch.cuda.is_available() else "cpu")
     ct = CaptionerType(captioner_type)
@@ -1405,7 +1400,22 @@ def compute_video_latents(
             from ltx_core.model.audio_vae import AudioProcessor, load_audio_encoder
         except ImportError:
             from ltx_core.model.audio_vae import AudioProcessor
-            from ltx_trainer.model_loader import load_audio_vae_encoder as load_audio_encoder
+
+            def load_audio_encoder(
+                checkpoint_path: str | Path,
+                device: str | torch.device = "cpu",
+                dtype: torch.dtype = torch.bfloat16,
+            ):
+                from ltx_core.loader import SingleGPUModelBuilder
+                from ltx_core.model.audio_vae import AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER, AudioEncoderConfigurator
+
+                if isinstance(device, str):
+                    device = torch.device(device)
+                return SingleGPUModelBuilder(
+                    model_path=str(checkpoint_path),
+                    model_class_configurator=AudioEncoderConfigurator,
+                    model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+                ).build(device=device, dtype=dtype)
 
         print("Loading audio VAE encoder...")
         audio_vae_encoder = load_audio_encoder(checkpoint_path, device=dev, dtype=torch.float32)
