@@ -1303,14 +1303,15 @@ def encode_audio(
     device = next(audio_vae_encoder.parameters()).device
     dtype = next(audio_vae_encoder.parameters()).dtype
 
-    waveform = waveform.to(device=device, dtype=dtype)
     if waveform.dim() == 2:
         waveform = waveform.unsqueeze(0)
 
     duration = waveform.shape[-1] / sampling_rate
 
-    mel = audio_processor.waveform_to_mel(Audio(waveform=waveform, sampling_rate=sampling_rate))
-    mel = mel.to(dtype=dtype)
+    mel_device = device if device.type == "cuda" else "cpu"
+    waveform_mel = waveform.to(device=mel_device, dtype=dtype)
+    mel = audio_processor.waveform_to_mel(Audio(waveform=waveform_mel, sampling_rate=sampling_rate))
+    mel = mel.to(device=device, dtype=dtype)
 
     latents = audio_vae_encoder(mel)
     _, _channels, time_steps, freq_bins = latents.shape
@@ -1398,37 +1399,37 @@ def compute_video_latents(
     audio_vae_encoder = None
     audio_processor = None
     if with_audio:
-        try:
-            from ltx_core.model.audio_vae import AudioProcessor, load_audio_encoder
-        except ImportError:
-            from ltx_core.model.audio_vae import AudioProcessor
+        from ltx_core.loader import SingleGPUModelBuilder
+        from ltx_core.model.audio_vae import (
+            AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+            AudioEncoderConfigurator,
+            AudioProcessor,
+        )
 
-            def load_audio_encoder(
-                checkpoint_path: str | Path,
-                device: str | torch.device = "cpu",
-                dtype: torch.dtype = torch.bfloat16,
-            ):
-                from ltx_core.loader import SingleGPUModelBuilder
-                from ltx_core.model.audio_vae import AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER, AudioEncoderConfigurator
-
-                if isinstance(device, str):
-                    device = torch.device(device)
-                return SingleGPUModelBuilder(
-                    model_path=str(checkpoint_path),
-                    model_class_configurator=AudioEncoderConfigurator,
-                    model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
-                ).build(device=device, dtype=dtype)
+        def load_audio_encoder(
+            checkpoint_path: str | Path,
+            device: str | torch.device = "cpu",
+            dtype: torch.dtype = torch.bfloat16,
+        ):
+            if isinstance(device, str):
+                device = torch.device(device)
+            return SingleGPUModelBuilder(
+                model_path=str(checkpoint_path),
+                model_class_configurator=AudioEncoderConfigurator,
+                model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+            ).build(device=device, dtype=dtype)
 
         print("Loading audio VAE encoder...")
         audio_vae_encoder = load_audio_encoder(checkpoint_path, device=dev, dtype=torch.float32)
         audio_vae_encoder.eval()
 
+        mel_device = dev if dev.type == "cuda" else torch.device("cpu")
         audio_processor = AudioProcessor(
             target_sample_rate=audio_vae_encoder.sample_rate,
             mel_bins=audio_vae_encoder.mel_bins,
             mel_hop_length=audio_vae_encoder.mel_hop_length,
             n_fft=audio_vae_encoder.n_fft,
-        ).to(dev)
+        ).to(mel_device)
 
     audio_success_count = 0
     audio_skip_count = 0
