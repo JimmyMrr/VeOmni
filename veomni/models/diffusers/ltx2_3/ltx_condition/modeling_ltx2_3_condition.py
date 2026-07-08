@@ -234,14 +234,16 @@ class LTXVideoConditionModel(PreTrainedModel):
 
         self.embeddings_processor = build_embeddings_processor(transformer_config, with_feature_extractor=False)
 
-        _load_embeddings_processor_weights(self.embeddings_processor, base, device=device, dtype=torch.bfloat16)
+        load_device = torch.device("cpu") if self.meta_init else device
+        _load_embeddings_processor_weights(self.embeddings_processor, base, device=load_device, dtype=torch.bfloat16)
 
         logger.info_rank0(
             f"VeOmni connector inner_dim={self.embeddings_processor.video_connector.inner_dim}, "
             f"heads={self.embeddings_processor.video_connector.num_attention_heads}"
         )
 
-        self.embeddings_processor = self.embeddings_processor.to(device=device, dtype=torch.bfloat16)
+        if not self.meta_init:
+            self.embeddings_processor = self.embeddings_processor.to(device=device, dtype=torch.bfloat16)
 
         if not self.config.with_audio:
             self.embeddings_processor.audio_connector = None
@@ -545,7 +547,7 @@ class LTXVideoConditionModel(PreTrainedModel):
                 audio_training_target = audio_noise - audio_on_device
 
                 audio_seq_len = noisy_audio.shape[2]
-                audio_loss_mask = torch.ones(B, audio_seq_len, dtype=torch.float32, device=device)
+                audio_loss_mask = torch.ones(B, audio_seq_len, dtype=torch.bool, device=device)
 
                 packed_conditions["audio_hidden_states"].append(noisy_audio)
                 packed_conditions["audio_timestep"].append(timestep)

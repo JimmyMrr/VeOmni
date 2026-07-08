@@ -93,7 +93,13 @@ model:
 
   # LTX-2.3 has non-standard RoPE, pin to eager until a dedicated kernel exists
   ops_implementation:
+    attn_implementation: eager
     rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    moe_implementation: eager
+    load_balancing_loss_implementation: eager
 
 # -----------------------------------------------------------------------------
 # Data Configuration
@@ -166,7 +172,7 @@ train:
     lr_decay_style: linear
     lr_min: 1.0e-5  # 10% of lr, matches LTX-2 LinearLR end_factor=0.1
     lr_warmup_ratio: 0.0  # no warmup, matches LTX-2 (which uses LinearLR without warmup)
-    weight_decay: 0.0  # LTX-2 uses PyTorch default (no weight decay)
+    weight_decay: 0.1  # LTX-2 uses PyTorch default (no weight decay)
     max_grad_norm: 1.0
 
   # Parallelism & mixed precision
@@ -174,6 +180,7 @@ train:
     ulysses_size: 1
     fsdp_config:
       fsdp_mode: fsdp2
+      offload: true
       mixed_precision:
         enable: true
         param_dtype: bfloat16
@@ -183,7 +190,7 @@ train:
   checkpoint:
     output_dir: "outputs/ltx2_av_lora"
     save_steps: 250
-    save_hf_weights: true
+    save_hf_weights: false
     # Optional: resume from a previous checkpoint
     # load_path: "path/to/checkpoint"
 
