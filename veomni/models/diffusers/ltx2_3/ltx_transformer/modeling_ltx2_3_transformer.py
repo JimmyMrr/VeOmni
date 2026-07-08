@@ -455,6 +455,7 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
         fps: list[float] | None = None,
         training_target: list[torch.Tensor] | None = None,
         audio_training_target: list[torch.Tensor] | None = None,
+        audio_loss_mask: list[torch.Tensor] | None = None,
     ):
         video_patchifier = VideoLatentPatchifier(patch_size=1)
         audio_patchifier = AudioPatchifier(patch_size=1) if self.config.with_audio else None
@@ -680,7 +681,7 @@ def compute_ltx2_loss(
             assert mask_batch == B, f"Loss mask batch size {mask_batch} != prediction batch size {B}"
             loss_mask = sample_vlm.view(B, 1, F, H, W).float()
             masked_loss = per_element_loss * loss_mask
-            valid_count = loss_mask.reshape(B, 1, -1).sum(dim=-1).clamp(min=1e-8)
+            valid_count = loss_mask.reshape(B, -1).sum(dim=-1).clamp(min=1e-8)
             per_sample_loss = masked_loss.reshape(B, C, -1).sum(dim=-1).mean(dim=-1) / valid_count
         else:
             per_sample_loss = per_element_loss.reshape(B, -1).mean(dim=1)

@@ -1485,6 +1485,7 @@ def save_parquet(
     output_dir: str,
     shard_size: int = 1000,
     pad_to_multiple_of: int | None = None,
+    with_audio: bool = False,
 ) -> None:
     """Pack precomputed ``.pt`` files into parquet shards for offline training.
 
@@ -1503,6 +1504,8 @@ def save_parquet(
         pad_to_multiple_of: If set, pad total samples to be divisible by this number.
             Useful for ensuring even distribution across DP ranks in distributed training.
             For example, set to ``dp_size`` to prevent FSDP2 deadlocks.
+        with_audio: If True, validate and report audio field coverage.
+            Warns when audio_latents or audio_prompt_embeds are missing.
     """
     import pickle as pk
 
@@ -1519,6 +1522,14 @@ def save_parquet(
     if not conditions_dir.is_dir():
         print(f"ERROR: conditions directory not found: {conditions_dir}")
         sys.exit(1)
+
+    has_audio_latents_dir = audio_latents_dir.is_dir()
+    if with_audio and not has_audio_latents_dir:
+        print(
+            f"WARNING: --with_audio is set but audio_latents directory not found: {audio_latents_dir}\n"
+            f"  Audio latents will NOT be included in the parquet output.\n"
+            f"  Re-run the 'preprocess' command with --with_audio to generate audio latents."
+        )
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -1544,6 +1555,10 @@ def save_parquet(
 
     all_samples: list[dict] = []
     skipped = 0
+    audio_latents_count = 0
+    audio_prompt_embeds_count = 0
+    missing_audio_latents = 0
+    missing_audio_prompt_embeds = 0
 
     for latent_file in tqdm(latent_files, desc="Packing parquet"):
         rel = latent_file.relative_to(latents_dir)
@@ -1571,7 +1586,12 @@ def save_parquet(
         else:
             merged["conditions"] = cond_data
 
-        if audio_latents_dir.is_dir():
+        if "audio_prompt_embeds" in merged:
+            audio_prompt_embeds_count += 1
+        elif with_audio:
+            missing_audio_prompt_embeds += 1
+
+        if has_audio_latents_dir:
             audio_file = audio_latents_dir / rel
             if audio_file.is_file():
                 audio_data = torch.load(audio_file, map_location="cpu", weights_only=True)
@@ -1585,6 +1605,15 @@ def save_parquet(
                         merged["audio_duration"] = audio_data["duration"]
                 else:
                     merged["audio_latents"] = audio_data
+                audio_latents_count += 1
+            elif with_audio:
+                missing_audio_latents += 1
+
+        if len(all_samples) == 0:
+            _audio_keys = [k for k in merged if "audio" in k]
+            print(f"  First sample ({rel}) fields: {sorted(merged.keys())}")
+            if with_audio:
+                print(f"  First sample audio fields: {_audio_keys if _audio_keys else '(none)'}")
 
         all_samples.append(_to_bytes(merged))
 
@@ -1614,6 +1643,30 @@ def save_parquet(
     print(f"Packed {total_saved} samples into {num_shards} parquet shards -> {output_path}")
     if skipped:
         print(f"  Skipped {skipped} samples (missing condition files)")
+
+    if with_audio or audio_latents_count > 0 or audio_prompt_embeds_count > 0:
+        print("\n=== Audio field summary ===")
+        print(f"  audio_latents:       {audio_latents_count}/{original_count} samples")
+        print(f"  audio_prompt_embeds: {audio_prompt_embeds_count}/{original_count} samples")
+        if with_audio:
+            _audio_ok = audio_latents_count > 0 and audio_prompt_embeds_count > 0
+            if _audio_ok:
+                print("  Audio-video training is READY.")
+            else:
+                _missing_parts = []
+                if missing_audio_latents > 0:
+                    _missing_parts.append(f"audio_latents missing for {missing_audio_latents} samples")
+                if missing_audio_prompt_embeds > 0:
+                    _missing_parts.append(f"audio_prompt_embeds missing for {missing_audio_prompt_embeds} samples")
+                if audio_latents_count == 0 and not has_audio_latents_dir:
+                    _missing_parts.append("audio_latents/ directory does not exist")
+                if audio_prompt_embeds_count == 0:
+                    _missing_parts.append("conditions files lack audio_prompt_embeds")
+                print(
+                    f"  WARNING: Audio data is INCOMPLETE — loss will be video-only.\n"
+                    f"  Issues: {'; '.join(_missing_parts)}\n"
+                    f"  Fix: re-run 'preprocess' with --with_audio, then re-run 'save-parquet --with_audio'."
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1820,6 +1873,11 @@ def main():
         default=None,
         help="Pad total samples to be divisible by this number (e.g., dp_size for distributed training)",
     )
+    sp_parquet.add_argument(
+        "--with_audio",
+        action="store_true",
+        help="Validate and report audio field coverage (audio_latents + audio_prompt_embeds)",
+    )
 
     # --- all ---
     sp_all = subparsers.add_parser("all", help="Run full pipeline: split → caption → preprocess")
@@ -1935,6 +1993,7 @@ def main():
             output_dir=args.output_dir,
             shard_size=args.shard_size,
             pad_to_multiple_of=args.pad_to_multiple_of,
+            with_audio=args.with_audio,
         )
 
     elif args.command == "all":
