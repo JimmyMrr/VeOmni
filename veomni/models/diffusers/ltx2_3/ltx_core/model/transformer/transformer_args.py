@@ -1,4 +1,3 @@
-import os
 from dataclasses import dataclass, replace
 
 import torch
@@ -220,13 +219,6 @@ class TransformerArgsPreprocessor:
             prompt_timestep, _ = self._prepare_timestep(
                 modality.sigma, self.prompt_adaln, batch_size, modality.latent.dtype
             )
-            if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
-                with torch.no_grad():
-                    print(
-                        f"[LTX-2 CP3.6a] prompt_timestep: shape={list(prompt_timestep.shape)}, "
-                        f"mean={prompt_timestep.float().mean().item():.8f}, "
-                        f"std={prompt_timestep.float().std().item():.8f}"
-                    )
         context = self._prepare_context(modality.context, x)
         attention_mask = self._prepare_attention_mask(modality.context_mask, modality.latent.dtype)
         pe = self._prepare_positional_embeddings(

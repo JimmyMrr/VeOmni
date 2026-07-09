@@ -411,11 +411,6 @@ class LTXVideoConditionModel(PreTrainedModel):
 
             if _dbg:
                 print(
-                    f"[LTX-2 CP0] video_features: shape={list(sample_features.shape)}, "
-                    f"dtype={sample_features.dtype}, mean={sample_features.float().mean():.8f}, "
-                    f"std={sample_features.float().std():.8f}"
-                )
-                print(
                     f"[LTX-2 CP0] with_audio={self.config.with_audio}, "
                     f"audio_context_is_none={audio_context is None}, "
                     f"sample_audio_features_is_none={sample_audio_features is None}, "
@@ -427,32 +422,16 @@ class LTXVideoConditionModel(PreTrainedModel):
                         f"dtype={sample_audio_features.dtype}, mean={sample_audio_features.float().mean():.8f}, "
                         f"std={sample_audio_features.float().std():.8f}"
                     )
-                print(f"[LTX-2 CP0] mask: shape={list(sample_mask.shape)}, sum={sample_mask.sum().item()}")
-
-                vc = self.embeddings_processor.video_connector
-                first_param = next(iter(vc.parameters()))
-                print(
-                    f"[LTX-2 CP0] connector_weight: dtype={first_param.dtype}, "
-                    f"mean={first_param.float().mean():.8f}, std={first_param.float().std():.8f}"
-                )
 
             with torch.no_grad():
                 video_embeds, audio_embeds, binary_mask = self.embeddings_processor.create_embeddings(
                     sample_features, sample_audio_features, additive_mask
                 )
 
-            if _dbg:
+            if _dbg and audio_embeds is not None:
                 print(
-                    f"[LTX-2 CP1] video_embeds: shape={list(video_embeds.shape)}, "
-                    f"mean={video_embeds.float().mean():.8f}, std={video_embeds.float().std():.8f}"
-                )
-                if audio_embeds is not None:
-                    print(
-                        f"[LTX-2 CP1] audio_embeds: shape={list(audio_embeds.shape)}, "
-                        f"mean={audio_embeds.float().mean():.8f}, std={audio_embeds.float().std():.8f}"
-                    )
-                print(
-                    f"[LTX-2 CP1] attention_mask: shape={list(binary_mask.shape)}, sum={binary_mask.float().sum():.0f}"
+                    f"[LTX-2 CP1] audio_embeds: shape={list(audio_embeds.shape)}, "
+                    f"mean={audio_embeds.float().mean():.8f}, std={audio_embeds.float().std():.8f}"
                 )
 
             latents_on_device = sample_latents.to(device=device, dtype=compute_dtype)
@@ -472,13 +451,6 @@ class LTXVideoConditionModel(PreTrainedModel):
                 conditioning_mask = torch.zeros_like(conditioning_mask)
                 timestep = torch.full((B,), 0.5, device=device, dtype=compute_dtype)
                 noise = torch.full_like(latents_on_device, 0.1)
-                _step = int(os.environ.get("LTX_DEBUG_STEP", "0"))
-                if _step == 0:
-                    print(
-                        f"[LTX-2 DEBUG] sigma={timestep[0].item():.8f}, "
-                        f"noise_mean={noise.mean():.8f}, noise_std={noise.std():.8f}, "
-                        f"cond_mask_sum={conditioning_mask.sum().item()}"
-                    )
 
             if not _dbg:
                 if timestep_sampling_mode == "shifted_logit_normal":
@@ -507,20 +479,6 @@ class LTXVideoConditionModel(PreTrainedModel):
 
             training_target = noise.to(device=device) - latents_on_device.to(device=device)
             video_loss_mask = (~conditioning_mask).float()
-
-            if _dbg:
-                print(
-                    f"[LTX-2 CP2] latents: shape={list(latents_on_device.shape)}, "
-                    f"mean={latents_on_device.float().mean():.8f}, std={latents_on_device.float().std():.8f}"
-                )
-                print(
-                    f"[LTX-2 CP2] noisy_latents: mean={noisy_latents.float().mean():.8f}, "
-                    f"std={noisy_latents.float().std():.8f}"
-                )
-                print(
-                    f"[LTX-2 CP2] target: mean={training_target.float().mean():.8f}, "
-                    f"std={training_target.float().std():.8f}"
-                )
 
             packed_conditions["hidden_states"].append(noisy_latents)
             packed_conditions["timestep"].append(timestep)

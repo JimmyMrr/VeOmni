@@ -322,10 +322,6 @@ class LTXModel(torch.nn.Module):
         audio: TransformerArgs | None,
         perturbations: BatchedPerturbationConfig | None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
-        import os as _os
-
-        _dbg = _os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1"
-
         if perturbations is None:
             batch_size = (video or audio).x.shape[0]
             perturbations = BatchedPerturbationConfig.empty(batch_size)
@@ -357,13 +353,6 @@ class LTXModel(torch.nn.Module):
                 )
             else:
                 video, audio = block(video=video, audio=audio)
-
-            if _dbg and video is not None and block_idx in (0, 1, 2, 23, 47):
-                print(
-                    f"[LTX-2 CP3.6-layer{block_idx}] x.dtype={video.x.dtype}, "
-                    f"shape={list(video.x.shape)}, "
-                    f"mean={video.x.float().mean().item():.8f}, std={video.x.float().std().item():.8f}"
-                )
 
         return video, audio
 

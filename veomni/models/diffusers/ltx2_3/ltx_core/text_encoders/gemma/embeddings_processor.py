@@ -63,24 +63,8 @@ class EmbeddingsProcessor(nn.Module):
         if self.audio_connector is None and audio_features is not None:
             raise ValueError("Audio features were provided but no audio connector is configured.")
 
-        import os as _os
-
-        _dbg = _os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1"
-
         sort_idx, mask_for_connector = _compute_right_pad_order(additive_attention_mask)
         video_features = _apply_right_pad_order(video_features, sort_idx)
-
-        if _dbg:
-            print(f"[LTX-2 EP] sort_idx[:10]={sort_idx[0, :10].tolist()}")
-            print(
-                f"[LTX-2 EP] mask_for_connector: shape={list(mask_for_connector.shape)}, "
-                f"dtype={mask_for_connector.dtype}, "
-                f"valid_count={(mask_for_connector >= 0).sum().item()}"
-            )
-            print(
-                f"[LTX-2 EP] video_features_reordered: mean={video_features.float().mean():.8f}, "
-                f"std={video_features.float().std():.8f}"
-            )
 
         video_encoded, video_mask = self.video_connector(video_features, mask_for_connector)
         binary_mask = _to_binary_mask(video_mask, video_encoded.shape[:2])

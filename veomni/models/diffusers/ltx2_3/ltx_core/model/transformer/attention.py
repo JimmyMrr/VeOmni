@@ -523,30 +523,10 @@ class Attention(torch.nn.Module):
         Returns:
             Output tensor of shape ``(B, T, query_dim)``.
         """
-        import os
-
-        _dbg = os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1"
-        _is_self_attn = context is None
-
-        # 使用实例属性跟踪，确保每个实例的第一次 self-attention 都打印
-        if not hasattr(self, "_self_attn_count"):
-            self._self_attn_count = 0
-
-        _is_first_self_attn = _dbg
-        if _is_self_attn:
-            self._self_attn_count += 1
-
         context = x if context is None else context
         use_attention = not all_perturbed
 
         v = self.to_v(context)
-
-        if _is_first_self_attn:
-            with torch.no_grad():
-                print(
-                    f"[LTX-2 ATTN-0] v: shape={list(v.shape)}, dtype={v.dtype}, "
-                    f"mean={v.float().mean().item():.8f}, std={v.float().std().item():.8f}"
-                )
 
         if not use_attention:
             out = v
@@ -554,38 +534,12 @@ class Attention(torch.nn.Module):
             q = self.to_q(x)
             k = self.to_k(context)
 
-            if _is_first_self_attn:
-                with torch.no_grad():
-                    print(
-                        f"[LTX-2 ATTN-0] after linear proj: "
-                        f"q.shape={list(q.shape)}, q.mean={q.float().mean().item():.8f}, q.std={q.float().std().item():.8f}, "
-                        f"k.shape={list(k.shape)}, k.mean={k.float().mean().item():.8f}, k.std={k.float().std().item():.8f}"
-                    )
-                    print(f"[LTX-2 ATTN-0] q_norm weight mean={self.q_norm.weight.float().mean().item():.8f}")
-                    print(f"[LTX-2 ATTN-0] k_norm weight mean={self.k_norm.weight.float().mean().item():.8f}")
-
             q, k = self.preattention_function(q, k, self, mask, pe, k_pe)
-
-            if _is_first_self_attn:
-                with torch.no_grad():
-                    print(
-                        f"[LTX-2 ATTN-0] after preattention (RoPE): "
-                        f"q.mean={q.float().mean().item():.8f}, k.mean={k.float().mean().item():.8f}"
-                    )
 
             if mask is None:
                 out = self.attention_function(q, k, v, self.heads)  # (B, T, H*D)
             else:
                 out = self.masked_attention_function(q, k, v, self.heads, mask)
-
-            if _is_first_self_attn:
-                with torch.no_grad():
-                    print(
-                        f"[LTX-2 ATTN-0] after attention: "
-                        f"shape={list(out.shape)}, mean={out.float().mean().item():.8f}, "
-                        f"std={out.float().std().item():.8f}, "
-                        f"attn_fn={type(self.attention_function).__name__}"
-                    )
 
             if perturbation_mask is not None:
                 out = out * perturbation_mask + v * (1 - perturbation_mask)
@@ -595,13 +549,5 @@ class Attention(torch.nn.Module):
             out = self.gated_attention_function(x, out, self)
 
         out = self.to_out(out)
-
-        if _is_first_self_attn:
-            with torch.no_grad():
-                print(
-                    f"[LTX-2 ATTN-0] after to_out: "
-                    f"shape={list(out.shape)}, mean={out.float().mean().item():.8f}, "
-                    f"std={out.float().std().item():.8f}"
-                )
 
         return out
