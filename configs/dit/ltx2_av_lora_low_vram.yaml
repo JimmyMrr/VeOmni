@@ -33,7 +33,12 @@ model:
   # Path to the condition model (text encoder + scheduler + VAE)
   condition_model_path: "path/to/gemma-text-encoder"
 
-  config_path: ./configs/model_configs/ltx2_3/ltx2_3_av.json
+  config_path: "configs/model_configs/ltx2_3/ltx2_3_av.json"
+
+  # Extra config passed to LTXVideoConditionModelConfig.from_pretrained()
+  condition_model_cfg:
+    # Whether to enable audio modality in the condition model
+    with_audio: true
 
   # LoRA configuration — lower rank (16) for memory-constrained setups
   lora_config:
@@ -52,9 +57,15 @@ model:
       # - "audio_ff.net.0.proj"
       # - "audio_ff.net.2"
 
-  # LTX-2.3 has non-standard RoPE, pin to eager
+  # LTX-2.3 has non-standard RoPE, pin to eager until a dedicated kernel exists
   ops_implementation:
+    attn_implementation: eager
     rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    moe_implementation: eager
+    load_balancing_loss_implementation: eager
 
 # -----------------------------------------------------------------------------
 # Data Configuration
@@ -82,7 +93,7 @@ data:
 # Training Configuration
 # -----------------------------------------------------------------------------
 train:
-  training_task: online_training
+  training_task: offline_training
 
   global_batch_size: 8
   micro_batch_size: 1
@@ -105,21 +116,28 @@ train:
     type: adamw
     lr: 1.0e-4
     lr_decay_style: linear
+    lr_min: 1.0e-5
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.01
     max_grad_norm: 1.0
 
   accelerator:
     ulysses_size: 1
     fsdp_config:
       fsdp_mode: fsdp2
+      offload: true
       mixed_precision:
         enable: true
         param_dtype: bfloat16
         cast_forward_inputs: false
+    offload_config:
+      enable_activation: true
+      activation_gpu_limit: 2.0
 
   checkpoint:
     output_dir: "outputs/ltx2_av_lora_low_vram"
     save_steps: 250
-    save_hf_weights: true
+    save_hf_weights: false
 
   wandb:
     enable: false
