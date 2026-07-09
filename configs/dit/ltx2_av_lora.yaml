@@ -185,6 +185,9 @@ train:
         enable: true
         param_dtype: bfloat16
         cast_forward_inputs: false
+    offload_config:
+      enable_activation: true
+      activation_gpu_limit: 2.0
 
   # Checkpoint settings
   checkpoint:
