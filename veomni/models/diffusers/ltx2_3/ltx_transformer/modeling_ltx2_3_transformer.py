@@ -58,11 +58,6 @@ def LTXSPAttention_forward(
 ) -> torch.Tensor:
     is_cross_attention = context is not None
 
-    if x.dtype != torch.bfloat16:
-        x = x.to(torch.bfloat16)
-    if context is not None and context.dtype != torch.bfloat16:
-        context = context.to(torch.bfloat16)
-
     context = x if context is None else context
     use_attention = not all_perturbed
 
