@@ -4,14 +4,39 @@ Integrates scene splitting, video captioning, text embedding computation,
 and video/audio latent encoding into a single script.
 
 Subcommands:
-    split-scenes   Split raw videos into scene clips using PySceneDetect
-    caption        Auto-caption video clips using a multimodal model
-    preprocess     Compute text embeddings + VAE latents from a dataset file
-    save-parquet   Pack precomputed .pt files into parquet for offline training
-    all            Run the full pipeline: split → caption → preprocess
+    split-scenes       Split raw videos into scene clips using PySceneDetect
+    caption            Auto-caption video clips using a multimodal model
+    compute-reference  Generate Canny edge reference videos for IC-LoRA
+    preprocess         Compute text embeddings + VAE latents from a dataset file
+    save-parquet       Pack precomputed .pt files into parquet for offline training
+    all                Run the full pipeline: split → caption → preprocess
 
 Usage examples:
-    # Full pipeline
+
+    # Generate dataset.json by auto-captioning videos (Qwen2.5-Omni, local)
+    python preprocess_dataset.py caption \
+        --input_dir /path/to/videos \
+        --output /path/to/videos/dataset.json
+
+    # Generate dataset.json with Gemini API (requires GOOGLE_API_KEY env var)
+    python preprocess_dataset.py caption \
+        --input_dir /path/to/videos \
+        --output /path/to/videos/dataset.json \
+        --captioner_type gemini_flash
+
+    # Generate dataset.json without audio processing
+    python preprocess_dataset.py caption \
+        --input_dir /path/to/videos \
+        --output /path/to/videos/dataset.json \
+        --no_audio
+
+    # Generate Canny edge reference videos for IC-LoRA
+    # (reads dataset.json, generates *_reference.mp4, updates dataset.json in-place)
+    python preprocess_dataset.py compute-reference \
+        --input_dir /path/to/videos \
+        --dataset_file /path/to/videos/dataset.json
+
+    # Full pipeline (split → caption → preprocess)
     python preprocess_dataset.py all \
         --video_dir /path/to/raw/videos \
         --data_dir /path/to/output \
@@ -27,12 +52,23 @@ Usage examples:
         --resolution_buckets 768x768x49
 
     # Preprocess with reference videos for IC-LoRA
+    # (auto-generates reference videos before encoding latents)
     python preprocess_dataset.py preprocess \
         --dataset_file /path/to/dataset.json \
         --gemma_model_path /path/to/gemma3 \
         --checkpoint_path /path/to/ltx2.safetensors \
         --resolution_buckets 768x768x49 \
         --reference_column reference_path
+
+    # IC-LoRA full pipeline with audio
+    python preprocess_dataset.py all \
+        --video_dir /path/to/raw/videos \
+        --data_dir /path/to/output \
+        --gemma_model_path /path/to/gemma3 \
+        --checkpoint_path /path/to/ltx2.safetensors \
+        --resolution_buckets 768x512x121 \
+        --reference_column reference_path \
+        --with_audio
 
 Output directory structure (after full pipeline):
     data_dir/
@@ -59,12 +95,14 @@ from pathlib import Path
 from typing import Any
 
 import av
+import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
+from torchvision.transforms import functional as TF
 from torchvision.transforms.functional import to_tensor
 from tqdm import tqdm
 
@@ -1476,6 +1514,138 @@ def compute_video_latents(
 
 
 # ---------------------------------------------------------------------------
+# Stage 3c: Compute reference videos for IC-LoRA training
+# ---------------------------------------------------------------------------
+
+
+def compute_reference_frames(images: torch.Tensor) -> torch.Tensor:
+    """Compute Canny edge detection on a batch of images.
+
+    Args:
+        images: Batch of images tensor of shape ``[B, C, H, W]`` in ``[0, 1]``.
+
+    Returns:
+        Binary edge masks tensor of shape ``[B, 3, H, W]``.
+    """
+    if images.shape[1] == 3:
+        images = TF.rgb_to_grayscale(images)
+
+    if images.max() > 1.0:
+        images = images / 255.0
+
+    edge_masks = []
+    for image in images:
+        image_np = (image.squeeze().cpu().numpy() * 255).astype("uint8")
+        edges = cv2.Canny(image_np, threshold1=100, threshold2=200)
+        edge_mask = torch.from_numpy(edges).float()
+        edge_masks.append(edge_mask)
+
+    edges = torch.stack(edge_masks)
+    edges = torch.stack([edges] * 3, dim=1)
+    return edges
+
+
+def save_reference_video(video: torch.Tensor, output_path: Path, fps: float) -> None:
+    """Save edge-detected frames as a reference video using PyAV.
+
+    Args:
+        video: ``[F, C, H, W]`` float tensor in ``[0, 255]``.
+        output_path: Output video file path.
+        fps: Frames per second for the output video.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    num_frames, _channels, height, width = video.shape
+
+    container = av.open(str(output_path), mode="w")
+    stream = container.add_stream("h264", rate=round(fps))
+    stream.width = width
+    stream.height = height
+    stream.pix_fmt = "yuv420p"
+
+    for i in range(num_frames):
+        frame_np = video[i].permute(1, 2, 0).cpu().numpy().astype("uint8")
+        frame = av.VideoFrame.from_ndarray(frame_np, format="rgb24")
+        for packet in stream.encode(frame):
+            container.mux(packet)
+
+    for packet in stream.encode():
+        container.mux(packet)
+    container.close()
+
+
+def compute_reference_videos(
+    input_dir: str,
+    dataset_file: str,
+    override: bool = False,
+    batch_size: int = 100,
+) -> None:
+    """Generate Canny edge reference videos for IC-LoRA training.
+
+    Reads videos listed in *dataset_file*, generates Canny edge detection
+    reference videos (named ``<stem>_reference.<ext>``), and updates
+    *dataset_file* in-place to add a ``reference_path`` field to each entry.
+
+    Args:
+        input_dir: Base directory for resolving video paths.
+        dataset_file: Path to dataset JSON file (must already exist).
+        override: Whether to regenerate existing reference videos.
+        batch_size: Number of frames to process per batch.
+    """
+    dataset_path = Path(dataset_file)
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset file does not exist: {dataset_path}")
+
+    base_dir = Path(input_dir).resolve()
+
+    with open(dataset_path, encoding="utf-8") as f:
+        dataset = json.load(f)
+
+    def _media_path_to_reference_path(media_file: Path) -> Path:
+        return media_file.parent / (media_file.stem + "_reference" + media_file.suffix)
+
+    media_paths = [base_dir / Path(entry["media_path"]) for entry in dataset]
+    reference_paths = {
+        entry["media_path"]: str(
+            _media_path_to_reference_path(base_dir / Path(entry["media_path"])).relative_to(base_dir)
+        )
+        for entry in dataset
+    }
+
+    processed = 0
+    for media_file in tqdm(media_paths, desc="Computing reference videos"):
+        rel_path = str(media_file.resolve().relative_to(base_dir))
+        reference_path = _media_path_to_reference_path(media_file)
+        reference_paths[rel_path] = str(reference_path.relative_to(base_dir))
+
+        if not reference_path.resolve().exists() or override:
+            try:
+                video, fps = _read_video_frames(media_file, max_frames=999999)
+
+                condition_frames = []
+                for i in range(0, len(video), batch_size):
+                    batch = video[i : i + batch_size]
+                    condition_batch = compute_reference_frames(batch)
+                    condition_frames.append(condition_batch)
+
+                all_condition = torch.cat(condition_frames, dim=0)
+                save_reference_video(all_condition, reference_path.resolve(), fps=fps)
+                processed += 1
+
+            except Exception as e:
+                print(f"  WARNING: Error processing {media_file}: {e}")
+                reference_paths.pop(rel_path, None)
+
+    for entry in dataset:
+        entry["reference_path"] = reference_paths[entry["media_path"]]
+
+    with open(dataset_path, "w", encoding="utf-8") as f:
+        json.dump(dataset, f, indent=2, ensure_ascii=False)
+
+    print(f"Processed {processed}/{len(media_paths)} reference videos")
+    print(f"Updated dataset file: {dataset_path}")
+
+
+# ---------------------------------------------------------------------------
 # Stage 4: Pack precomputed .pt files into parquet
 # ---------------------------------------------------------------------------
 
@@ -1685,6 +1855,8 @@ def run_pipeline(
     media_column: str = "media_path",
     max_sequence_length: int = 256,
     captioner_type: str = "qwen_omni",
+    caption_fps: int = 3,
+    caption_include_audio: bool = True,
     with_audio: bool = False,
     vae_tiling: bool = False,
     lora_trigger: str | None = None,
@@ -1692,6 +1864,7 @@ def run_pipeline(
     reshape_mode: str = "center",
     reference_column: str | None = None,
     reference_downscale_factor: int = 1,
+    reference_override: bool = False,
     device: str | None = None,
     load_in_8bit: bool = False,
     overwrite: bool = False,
@@ -1723,6 +1896,8 @@ def run_pipeline(
             output=str(ds_output),
             captioner_type=captioner_type,
             device=device,
+            fps=caption_fps,
+            include_audio=caption_include_audio,
         )
         dataset_file = str(ds_output)
 
@@ -1735,6 +1910,14 @@ def run_pipeline(
         if dataset_file is None:
             print("ERROR: No dataset file found. Provide --dataset_file or run with --video_dir.")
             sys.exit(1)
+
+    if reference_column:
+        print("\n=== Computing reference videos ===")
+        compute_reference_videos(
+            input_dir=str(Path(dataset_file).parent),
+            dataset_file=dataset_file,
+            override=reference_override,
+        )
 
     print("\n=== Computing caption embeddings ===")
     compute_caption_embeddings(
@@ -1831,6 +2014,14 @@ def main():
     sp_caption.add_argument("--no_audio", action="store_true")
     _add_common_args(sp_caption)
 
+    # --- compute-reference ---
+    sp_ref = subparsers.add_parser("compute-reference", help="Compute Canny edge reference videos for IC-LoRA")
+    sp_ref.add_argument("--input_dir", type=str, required=True, help="Base directory for resolving video paths")
+    sp_ref.add_argument("--dataset_file", type=str, required=True, help="Path to dataset JSON file")
+    sp_ref.add_argument("--batch_size", type=int, default=100, help="Batch size for processing frames")
+    sp_ref.add_argument("--override", action="store_true", help="Override existing reference video files")
+    _add_common_args(sp_ref)
+
     # --- preprocess ---
     sp_pre = subparsers.add_parser("preprocess", help="Compute text embeddings + VAE latents")
     sp_pre.add_argument("--dataset_file", type=str, required=True, help="Path to dataset CSV/JSON/JSONL")
@@ -1891,6 +2082,13 @@ def main():
     sp_all.add_argument("--media_column", type=str, default="media_path")
     sp_all.add_argument("--max_sequence_length", type=int, default=256)
     sp_all.add_argument("--captioner_type", type=str, default="qwen_omni")
+    sp_all.add_argument(
+        "--caption_fps", type=int, default=3, help="FPS for video captioning (default: 3, matches LTX-2)"
+    )
+    sp_all.add_argument(
+        "--caption_include_audio", action="store_true", default=True, help="Include audio in captioning"
+    )
+    sp_all.add_argument("--no_caption_audio", action="store_true", help="Disable audio in captioning")
     sp_all.add_argument("--lora_trigger", type=str, default=None)
     sp_all.add_argument("--remove_llm_prefixes", action="store_true")
     sp_all.add_argument("--reshape_mode", type=str, default="center", choices=["center", "random"])
@@ -1899,6 +2097,7 @@ def main():
     sp_all.add_argument("--load_in_8bit", action="store_true")
     sp_all.add_argument("--reference_column", type=str, default=None)
     sp_all.add_argument("--reference_downscale_factor", type=int, default=1)
+    sp_all.add_argument("--reference_override", action="store_true", help="Override existing reference videos")
     _add_common_args(sp_all)
 
     args = parser.parse_args()
@@ -1931,7 +2130,23 @@ def main():
             include_audio=not args.no_audio,
         )
 
+    elif args.command == "compute-reference":
+        compute_reference_videos(
+            input_dir=args.input_dir,
+            dataset_file=args.dataset_file,
+            override=args.override,
+            batch_size=args.batch_size,
+        )
+
     elif args.command == "preprocess":
+        if args.reference_column:
+            print("\n=== Computing reference videos ===")
+            compute_reference_videos(
+                input_dir=str(Path(args.dataset_file).parent),
+                dataset_file=args.dataset_file,
+                override=args.overwrite,
+            )
+
         buckets = parse_resolution_buckets(args.resolution_buckets)
 
         dataset_path = Path(args.dataset_file)
@@ -2008,6 +2223,8 @@ def main():
             media_column=args.media_column,
             max_sequence_length=args.max_sequence_length,
             captioner_type=args.captioner_type,
+            caption_fps=args.caption_fps,
+            caption_include_audio=not args.no_caption_audio,
             with_audio=args.with_audio,
             vae_tiling=args.vae_tiling,
             lora_trigger=args.lora_trigger,
@@ -2015,6 +2232,7 @@ def main():
             reshape_mode=args.reshape_mode,
             reference_column=args.reference_column,
             reference_downscale_factor=args.reference_downscale_factor,
+            reference_override=args.reference_override,
             device=args.device,
             load_in_8bit=args.load_in_8bit,
             overwrite=args.overwrite,
