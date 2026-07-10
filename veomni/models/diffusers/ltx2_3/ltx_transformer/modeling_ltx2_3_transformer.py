@@ -365,8 +365,29 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
             else:
                 timesteps = sigma.unsqueeze(1).expand(1, num_tokens)
 
-            latent_coords = video_patchifier.get_patch_grid_bounds(latent_shape, device=hidden_state.device)
-            positions = get_pixel_coords(latent_coords, VIDEO_SCALE_FACTORS, causal_fix=True)
+            sample_ref_seq_len = ref_seq_len[sample_idx] if ref_seq_len is not None else 0
+
+            if sample_ref_seq_len > 0:
+                B_hs, C_hs, F_total, H_hs, W_hs = hidden_state.shape
+                ref_frames = sample_ref_seq_len // (H_hs * W_hs)
+
+                ref_hs = hidden_state[:, :, :ref_frames, :, :]
+                target_hs = hidden_state[:, :, ref_frames:, :, :]
+
+                ref_shape = VideoLatentShape.from_torch_shape(ref_hs.shape)
+                target_shape = VideoLatentShape.from_torch_shape(target_hs.shape)
+
+                ref_coords = video_patchifier.get_patch_grid_bounds(ref_shape, device=hidden_state.device)
+                ref_pos = get_pixel_coords(ref_coords, VIDEO_SCALE_FACTORS, causal_fix=True)
+
+                target_coords = video_patchifier.get_patch_grid_bounds(target_shape, device=hidden_state.device)
+                target_pos = get_pixel_coords(target_coords, VIDEO_SCALE_FACTORS, causal_fix=True)
+
+                positions = torch.cat([ref_pos, target_pos], dim=2)
+            else:
+                latent_coords = video_patchifier.get_patch_grid_bounds(latent_shape, device=hidden_state.device)
+                positions = get_pixel_coords(latent_coords, VIDEO_SCALE_FACTORS, causal_fix=True)
+
             positions = positions.to(device=model_device, dtype=fsdp_param_dtype)
             sample_fps = fps[sample_idx] if fps is not None else DEFAULT_FPS
             positions[:, 0, ...] = positions[:, 0, ...] / sample_fps
