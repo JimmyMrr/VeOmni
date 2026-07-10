@@ -533,7 +533,7 @@ class LTXVideoConditionModel(PreTrainedModel):
             sample_fps = fps[i] if fps is not None else DEFAULT_FPS
             packed_conditions["fps"].append(sample_fps)
 
-            if self.config.with_audio and sample_audio_latents is not None:
+            if self.config.with_audio and sample_audio_latents is not None and sample_ref_latents is None:
                 audio_on_device = sample_audio_latents.to(device=device, dtype=compute_dtype)
                 audio_noise = torch.randn(
                     audio_on_device.shape,

@@ -1557,7 +1557,7 @@ def save_reference_video(video: torch.Tensor, output_path: Path, fps: float) -> 
     num_frames, _channels, height, width = video.shape
 
     container = av.open(str(output_path), mode="w")
-    stream = container.add_stream("h264", rate=round(fps))
+    stream = container.add_stream("libx264", rate=round(fps))
     stream.width = width
     stream.height = height
     stream.pix_fmt = "yuv420p"
