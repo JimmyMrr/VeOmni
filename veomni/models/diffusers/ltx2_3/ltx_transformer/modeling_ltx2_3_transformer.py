@@ -330,6 +330,7 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
         training_target: list[torch.Tensor] | None = None,
         audio_training_target: list[torch.Tensor] | None = None,
         audio_loss_mask: list[torch.Tensor] | None = None,
+        ref_seq_len: list[int] | None = None,
     ):
         video_patchifier = VideoLatentPatchifier(patch_size=1)
         audio_patchifier = AudioPatchifier(patch_size=1) if self.config.with_audio else None

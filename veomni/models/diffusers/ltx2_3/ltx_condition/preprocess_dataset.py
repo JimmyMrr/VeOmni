@@ -1561,6 +1561,7 @@ def save_reference_video(video: torch.Tensor, output_path: Path, fps: float) -> 
     stream.width = width
     stream.height = height
     stream.pix_fmt = "yuv420p"
+    stream.options = {"crf": "18"}
 
     for i in range(num_frames):
         frame_np = video[i].permute(1, 2, 0).cpu().numpy().astype("uint8")
@@ -1656,6 +1657,7 @@ def save_parquet(
     shard_size: int = 1000,
     pad_to_multiple_of: int | None = None,
     with_audio: bool = False,
+    reference_latents_dir: str | None = None,
 ) -> None:
     """Pack precomputed ``.pt`` files into parquet shards for offline training.
 
@@ -1685,6 +1687,9 @@ def save_parquet(
     latents_dir = precomputed / "latents"
     conditions_dir = precomputed / "conditions"
     audio_latents_dir = precomputed / "audio_latents"
+    ref_latents_dir = (
+        precomputed / reference_latents_dir if reference_latents_dir else precomputed / "reference_latents"
+    )
 
     if not latents_dir.is_dir():
         print(f"ERROR: latents directory not found: {latents_dir}")
@@ -1700,6 +1705,10 @@ def save_parquet(
             f"  Audio latents will NOT be included in the parquet output.\n"
             f"  Re-run the 'preprocess' command with --with_audio to generate audio latents."
         )
+
+    has_ref_latents_dir = ref_latents_dir.is_dir()
+    if reference_latents_dir and not has_ref_latents_dir:
+        print(f"WARNING: reference_latents directory not found: {ref_latents_dir}")
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -1778,6 +1787,21 @@ def save_parquet(
                 audio_latents_count += 1
             elif with_audio:
                 missing_audio_latents += 1
+
+        if has_ref_latents_dir:
+            ref_file = ref_latents_dir / rel
+            if ref_file.is_file():
+                ref_data = torch.load(ref_file, map_location="cpu", weights_only=True)
+                if isinstance(ref_data, dict) and "latents" in ref_data:
+                    merged["reference_latents"] = ref_data["latents"]
+                    if "num_frames" in ref_data:
+                        merged["reference_num_frames"] = ref_data["num_frames"]
+                    if "height" in ref_data:
+                        merged["reference_height"] = ref_data["height"]
+                    if "width" in ref_data:
+                        merged["reference_width"] = ref_data["width"]
+                else:
+                    merged["reference_latents"] = ref_data
 
         if len(all_samples) == 0:
             _audio_keys = [k for k in merged if "audio" in k]
@@ -2069,6 +2093,12 @@ def main():
         action="store_true",
         help="Validate and report audio field coverage (audio_latents + audio_prompt_embeds)",
     )
+    sp_parquet.add_argument(
+        "--reference_latents_dir",
+        type=str,
+        default=None,
+        help="Subdirectory name for reference latents (for IC-LoRA training)",
+    )
 
     # --- all ---
     sp_all = subparsers.add_parser("all", help="Run full pipeline: split → caption → preprocess")
@@ -2209,6 +2239,7 @@ def main():
             shard_size=args.shard_size,
             pad_to_multiple_of=args.pad_to_multiple_of,
             with_audio=args.with_audio,
+            reference_latents_dir=args.reference_latents_dir,
         )
 
     elif args.command == "all":

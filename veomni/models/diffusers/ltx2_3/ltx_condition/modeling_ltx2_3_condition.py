@@ -334,6 +334,7 @@ class LTXVideoConditionModel(PreTrainedModel):
         context_mask: list[torch.Tensor] | None = None,
         audio_context: list[torch.Tensor] | None = None,
         audio_latents: list[torch.Tensor] | None = None,
+        reference_latents: list[torch.Tensor] | None = None,
         first_frame_conditioning_p: float | None = None,
         timestep_sampling_mode: str | None = None,
         fps: list[float] | None = None,
@@ -356,8 +357,10 @@ class LTXVideoConditionModel(PreTrainedModel):
                 Falls back to ``self.config.timestep_sampling_mode`` if None.
         """
         if latents is None or context is None:
-            latents, context, context_mask, audio_context, audio_latents, fps = self._unpack_raw_batch(
-                kwargs, latents, context, context_mask, audio_context, audio_latents, fps
+            latents, context, context_mask, audio_context, audio_latents, reference_latents, fps = (
+                self._unpack_raw_batch(
+                    kwargs, latents, context, context_mask, audio_context, audio_latents, reference_latents, fps
+                )
             )
 
         if first_frame_conditioning_p is None:
@@ -385,12 +388,14 @@ class LTXVideoConditionModel(PreTrainedModel):
             "audio_training_target": [],
             "audio_loss_mask": [],
             "fps": [],
+            "ref_seq_len": [],
         }
 
         for i, (sample_latents, sample_features) in enumerate(zip(latents, context)):
             sample_mask = context_mask[i] if context_mask is not None else None
             sample_audio_features = audio_context[i] if audio_context is not None else None
             sample_audio_latents = audio_latents[i] if audio_latents is not None else None
+            sample_ref_latents = reference_latents[i] if reference_latents is not None else None
 
             sample_features = sample_features.to(device=device)
             if sample_mask is not None:
@@ -480,6 +485,43 @@ class LTXVideoConditionModel(PreTrainedModel):
             training_target = noise.to(device=device) - latents_on_device.to(device=device)
             video_loss_mask = (~conditioning_mask).float()
 
+            # Handle reference latents for IC-LoRA (video-to-video)
+            ref_seq_len = 0
+            if sample_ref_latents is not None:
+                ref_latents_on_device = sample_ref_latents.to(device=device, dtype=compute_dtype)
+                B_ref, C_ref, F_ref, H_ref, W_ref = ref_latents_on_device.shape
+
+                # Reference tokens are always conditioning (timestep=0, clean latents)
+                ref_conditioning_mask = torch.ones(B, F_ref * H_ref * W_ref, dtype=torch.bool, device=device)
+
+                # Concatenate reference (clean) and target (noisy) along frame dimension
+                # Reference latents come first, then target latents
+                combined_latents = torch.cat([ref_latents_on_device, noisy_latents], dim=2)
+                combined_F = F_ref + F
+
+                # Update conditioning mask: reference tokens are always conditioning
+                combined_conditioning_mask = torch.cat([ref_conditioning_mask, conditioning_mask], dim=1)
+
+                # Update loss mask: reference tokens excluded from loss
+                ref_loss_mask = torch.zeros(B, F_ref * H_ref * W_ref, dtype=torch.bool, device=device)
+                combined_video_loss_mask = torch.cat([ref_loss_mask, (~conditioning_mask)], dim=1).float()
+
+                # Update training target: reference tokens don't have targets (but we need to provide something)
+                # The model will predict velocity for reference tokens too, but loss won't be computed on them
+                ref_noise = torch.full_like(ref_latents_on_device, 0.0)
+                ref_target = ref_noise - ref_latents_on_device
+                combined_training_target = torch.cat([ref_target, training_target], dim=2)
+
+                # Replace the variables used for packing
+                noisy_latents = combined_latents
+                conditioning_mask = combined_conditioning_mask
+                video_loss_mask = combined_video_loss_mask
+                training_target = combined_training_target
+                ref_seq_len = F_ref * H_ref * W_ref
+
+                # Update F for the combined sequence
+                F = combined_F
+
             packed_conditions["hidden_states"].append(noisy_latents)
             packed_conditions["timestep"].append(timestep)
             packed_conditions["encoder_hidden_states"].append(video_embeds)
@@ -487,6 +529,7 @@ class LTXVideoConditionModel(PreTrainedModel):
             packed_conditions["training_target"].append(training_target)
             packed_conditions["latents"].append(latents_on_device.to(device=device))
             packed_conditions["video_loss_mask"].append(video_loss_mask)
+            packed_conditions["ref_seq_len"].append(ref_seq_len)
             sample_fps = fps[i] if fps is not None else DEFAULT_FPS
             packed_conditions["fps"].append(sample_fps)
 
@@ -532,6 +575,7 @@ class LTXVideoConditionModel(PreTrainedModel):
         context_mask,
         audio_context,
         audio_latents,
+        reference_latents,
         fps,
     ):
         """Unpack raw DiTDataCollator batch format into process_condition arguments."""
@@ -583,6 +627,20 @@ class LTXVideoConditionModel(PreTrainedModel):
                         audio_latents.to(device) if isinstance(audio_latents, torch.Tensor) else audio_latents
                     )
 
+            kwargs.pop("reference_latents", None)
+            if reference_latents is not None:
+                if isinstance(reference_latents, list):
+                    reference_latents = [
+                        (t.unsqueeze(0) if isinstance(t, torch.Tensor) and t.dim() == 4 else t).to(device)
+                        for t in reference_latents
+                    ]
+                else:
+                    reference_latents = (
+                        reference_latents.to(device)
+                        if isinstance(reference_latents, torch.Tensor)
+                        else reference_latents
+                    )
+
         elif "conditions" in kwargs:
             conditions_raw = kwargs.pop("conditions")
             audio_latents_raw = kwargs.pop("audio_latents", None)
@@ -624,7 +682,7 @@ class LTXVideoConditionModel(PreTrainedModel):
                         for t in audio_latents_raw
                     ]
 
-        return latents, context, context_mask, audio_context, audio_latents, fps
+        return latents, context, context_mask, audio_context, audio_latents, reference_latents, fps
 
     def _create_first_frame_conditioning_mask(
         self,
