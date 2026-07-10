@@ -128,8 +128,60 @@ def LTXVideoModel_forward(
     audio: Modality | None,
     perturbations: BatchedPerturbationConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    _dbg = os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1"
+
+    if _dbg:
+        with torch.no_grad():
+            _param_dtype = next(self.parameters()).dtype
+            _gc = getattr(self, "gradient_checkpointing", None)
+            _gc2 = getattr(self, "_enable_gradient_checkpointing", None)
+            print(
+                f"[LTX-2 CP3.6-pre] param_dtype={_param_dtype}, "
+                f"gradient_checkpointing={_gc}, _enable_gradient_checkpointing={_gc2}, "
+                f"training={self.training}"
+            )
+            if video is not None:
+                print(
+                    f"[LTX-2 CP3.6-pre] video.latent.dtype={video.latent.dtype}, "
+                    f"video.context.dtype={video.context.dtype}, "
+                    f"video.timesteps.dtype={video.timesteps.dtype}, "
+                    f"video.positions.dtype={video.positions.dtype}"
+                )
+
     video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
     audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
+
+    if _dbg and video_args is not None:
+        with torch.no_grad():
+            print(
+                f"[LTX-2 CP3.6a] After preprocessor: x.dtype={video_args.x.dtype}, "
+                f"x: shape={list(video_args.x.shape)}, "
+                f"mean={video_args.x.float().mean().item():.8f}, std={video_args.x.float().std().item():.8f}"
+            )
+            print(
+                f"[LTX-2 CP3.6a] context.dtype={video_args.context.dtype}, "
+                f"context: mean={video_args.context.float().mean().item():.8f}, "
+                f"std={video_args.context.float().std().item():.8f}"
+            )
+            print(
+                f"[LTX-2 CP3.6a] embedded_timestep.dtype={video_args.embedded_timestep.dtype}, "
+                f"embedded_timestep: mean={video_args.embedded_timestep.float().mean().item():.8f}, "
+                f"std={video_args.embedded_timestep.float().std().item():.8f}"
+            )
+            cos_freq, sin_freq = video_args.positional_embeddings
+            print(
+                f"[LTX-2 CP3.6a] cos_freq.dtype={cos_freq.dtype}, "
+                f"cos_freq: mean={cos_freq.float().mean().item():.8f}, "
+                f"sin_freq: mean={sin_freq.float().mean().item():.8f}"
+            )
+            if video_args.context_mask is not None:
+                print(
+                    f"[LTX-2 CP3.6a] context_mask.dtype={video_args.context_mask.dtype}, "
+                    f"shape={list(video_args.context_mask.shape)}, "
+                    f"sum={video_args.context_mask.float().sum().item():.2f}"
+                )
+            else:
+                print("[LTX-2 CP3.6a] context_mask=None")
 
     if get_parallel_state().sp_enabled and video_args is not None:
         video_args_x = slice_input_tensor(video_args.x, dim=1, group=get_parallel_state().sp_group)
@@ -181,6 +233,19 @@ def LTXVideoModel_forward(
         perturbations=perturbations,
     )
 
+    if _dbg and video_out is not None:
+        with torch.no_grad():
+            print(
+                f"[LTX-2 CP3.6b] After transformer blocks: x.dtype={video_out.x.dtype}, "
+                f"x: shape={list(video_out.x.shape)}, "
+                f"mean={video_out.x.float().mean().item():.8f}, std={video_out.x.float().std().item():.8f}"
+            )
+            print(
+                f"[LTX-2 CP3.6b] embedded_timestep.dtype={video_out.embedded_timestep.dtype}, "
+                f"embedded_timestep: mean={video_out.embedded_timestep.float().mean().item():.8f}, "
+                f"std={video_out.embedded_timestep.float().std().item():.8f}"
+            )
+
     if get_parallel_state().sp_enabled and video_out is not None:
         video_out = replace(video_out, x=gather_outputs(video_out.x, gather_dim=1))
     if get_parallel_state().sp_enabled and audio_out is not None:
@@ -193,6 +258,19 @@ def LTXVideoModel_forward(
         if video_out is not None
         else None
     )
+
+    if _dbg and vx is not None:
+        with torch.no_grad():
+            print(
+                f"[LTX-2 CP3.6c] After _process_output: vx.dtype={vx.dtype}, "
+                f"vx: shape={list(vx.shape)}, "
+                f"mean={vx.float().mean().item():.8f}, std={vx.float().std().item():.8f}"
+            )
+            _norm_w_dtype = self.norm_out.weight.dtype if self.norm_out.weight is not None else "None"
+            print(
+                f"[LTX-2 CP3.6c] scale_shift_table.dtype={self.scale_shift_table.dtype}, "
+                f"norm_out.weight.dtype={_norm_w_dtype}"
+            )
 
     ax = (
         self._process_output(
