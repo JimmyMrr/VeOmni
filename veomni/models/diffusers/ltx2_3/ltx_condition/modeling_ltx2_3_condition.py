@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -406,7 +407,11 @@ class LTXVideoConditionModel(PreTrainedModel):
                 device=device,
             )
 
-            if timestep_sampling_mode == "shifted_logit_normal":
+            if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
+                conditioning_mask = torch.zeros_like(conditioning_mask)
+                timestep = torch.full((B,), 0.5, device=device, dtype=compute_dtype)
+                noise = torch.full_like(latents_on_device, 0.1)
+            elif timestep_sampling_mode == "shifted_logit_normal":
                 seq_length = F * H * W
                 timestep = self._sample_shifted_logit_normal(B, seq_length, device).to(
                     device=device, dtype=compute_dtype
@@ -488,6 +493,9 @@ class LTXVideoConditionModel(PreTrainedModel):
                     dtype=compute_dtype,
                     device=device,
                 )
+
+                if os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1":
+                    audio_noise = torch.full_like(audio_on_device, 0.1)
 
                 noisy_audio = self.scheduler.scale_noise(audio_on_device, timestep, audio_noise)
                 audio_training_target = audio_noise - audio_on_device
